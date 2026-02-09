@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gtdb-downloader"
+version = "0.1.0"
+description = "A helper script to download GTDB genomes by taxonomy"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
+authors = [
+    {name = "Joachim Fritscher", email = "joachim.fritscher@gmail.com"}
+]
+dependencies = [
+    "requests>=2.28.0",
+]
+
+[project.scripts]
+gtdb-dl = "gtdb_downloader.cli:main"
+
+[tool.setuptools]
+packages = ["gtdb_downloader"]

@@ -1,0 +1,56 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+.eggs/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Type checker / linter / tooling caches
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local outputs and downloaded GTDB artifacts
+test_out/
+*.tsv
+*.tsv.gz
+*.tsv.gz.*
+*.csv
+*.csv.gz
+*.txt.gz
+*_metadata_r*.tsv.gz
+*_genomic.fna.gz
