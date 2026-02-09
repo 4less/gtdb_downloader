@@ -75,22 +75,22 @@ gtdb-dl --gtdb r226 --download --mirror asia-pacific1
 
 ```bash
 # Search by simple taxon name
-gtdb-dl --gtdb r226 --taxon "Firmicutes"
+gtdb-dl --gtdb r226 --taxon "Bacillota"
 
 # Full GTDB taxonomy path
-gtdb-dl --gtdb r226 --taxon "d__Bacteria;p__Firmicutes;c__Clostridia"
+gtdb-dl --gtdb r226 --taxon "d__Bacteria;p__Bacillota;c__Clostridia"
 
 # With verbose output
-gtdb-dl --gtdb r226 --taxon "Firmicutes" -v
+gtdb-dl --gtdb r226 --taxon "Bacillota" -v
 
 # Dry run (show what would be downloaded)
-gtdb-dl --gtdb r226 --taxon "Firmicutes" --dry-run
+gtdb-dl --gtdb r226 --taxon "Bacillota" --dry-run
 
 # Use different mirror
-gtdb-dl --gtdb r226 --taxon "Firmicutes" --mirror asia-pacific2
+gtdb-dl --gtdb r226 --taxon "Bacillota" --mirror asia-pacific2
 
 # Create symlink structure in custom directory
-gtdb-dl --gtdb r226 --taxon "Firmicutes" --output /path/to/my_project/genomes
+gtdb-dl --gtdb r226 --taxon "Bacillota" --output /path/to/my_project/genomes
 ```
 
 ### Custom base directory
@@ -99,11 +99,11 @@ By default, data is stored in `~/.gtdb_downloader`. Change this with an environm
 
 ```bash
 # Use custom directory for this session
-GTDBDL_DATA=/mnt/large_storage/gtdb gtdb-dl --gtdb r226 --taxon "Firmicutes"
+GTDBDL_DATA=/mnt/large_storage/gtdb gtdb-dl --gtdb r226 --taxon "Bacillota"
 
 # Or set permanently in your shell config (.bashrc, .zshrc, etc.)
 export GTDBDL_DATA=/mnt/large_storage/gtdb
-gtdb-dl --gtdb r226 --taxon "Firmicutes"
+gtdb-dl --gtdb r226 --taxon "Bacillota"
 ```
 
 ### Mirror options
