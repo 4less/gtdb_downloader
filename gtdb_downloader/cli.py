@@ -3,10 +3,16 @@
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 from gtdb_downloader.config import get_base_dir, GTDB_VERSIONS
-from gtdb_downloader.downloader import download_metadata, download_file, generate_download_link
+from gtdb_downloader.downloader import (
+    check_aria2c_available,
+    download_file,
+    download_files_aria2,
+    download_metadata,
+    generate_download_link,
+)
 from gtdb_downloader.metadata import MetadataParser
 
 
@@ -108,58 +114,74 @@ def download_genomes_for_taxon(
         print("\n[DRY RUN] Download would proceed for the above genomes")
         return True
     
-    downloaded_count = 0
+    downloadable: List[Tuple[str, str, str, Path]] = []
     failed_count = 0
-    
+
     for i, genome_id in enumerate(matching_genomes, 1):
         if verbose:
             print(f"\n[{i}/{len(matching_genomes)}] Processing {genome_id}...")
-        
-        # Get metadata row for this genome
+
         genome_metadata = parser.get_genome_metadata(genome_id)
         if genome_metadata is None:
             if verbose:
-                print(f"  Skipped: Could not find genome metadata")
+                print("  Skipped: Could not find genome metadata")
             failed_count += 1
             continue
-        
-        # Get taxonomy info
+
         tax_info = parser.get_taxon_path(genome_id)
         if tax_info is None:
             if verbose:
-                print(f"  Skipped: Could not find taxonomy info")
+                print("  Skipped: Could not find taxonomy info")
             failed_count += 1
             continue
-        
-        taxonomy_str, det_dataset = tax_info
-        
-        # Generate download link
+
+        taxonomy_str, _ = tax_info
+
         try:
             download_url = generate_download_link(genome_metadata)
-            # Filename is the last part of the URL (after last /)
             genome_filename = download_url.split("/")[-1]
         except Exception as e:
             if verbose:
                 print(f"  Skipped: Could not generate download link: {e}")
             failed_count += 1
             continue
-        
-        # Download genome
+
         genome_path = genomes_dir / genome_filename
-        
-        if genome_path.exists():
+        downloadable.append((genome_id, taxonomy_str, download_url, genome_path))
+        if verbose and not genome_path.exists():
+            print(f"  Queued download: {download_url}")
+
+    missing_downloads: List[Tuple[str, Path]] = [
+        (url, genome_path) for _, _, url, genome_path in downloadable if not genome_path.exists()
+    ]
+
+    if missing_downloads:
+        if check_aria2c_available():
+            tmp_dir = genomes_dir / ".tmp"
+            print(f"\nStarting batch download of {len(missing_downloads)} genomes with aria2c...")
             if verbose:
-                print(f"  Already exists: {genome_path}")
+                print(f"aria2 temp/session dir: {tmp_dir}")
+            batch_results = download_files_aria2(
+                missing_downloads,
+                verbose=verbose,
+                tmp_dir=tmp_dir,
+            )
         else:
+            print(f"\naria2c not found; downloading {len(missing_downloads)} genomes sequentially with wget...")
+            batch_results = {}
+            for url, genome_path in missing_downloads:
+                batch_results[genome_path] = download_file(url, genome_path, verbose=verbose, use_aria2=False)
+    else:
+        batch_results = {}
+
+    downloaded_count = 0
+    for genome_id, taxonomy_str, _, genome_path in downloadable:
+        if not genome_path.exists() and not batch_results.get(genome_path, False):
             if verbose:
-                print(f"  Downloading from: {download_url}")
-            
-            if not download_file(download_url, genome_path, verbose=verbose):
-                if verbose:
-                    print(f"  Failed to download")
-                failed_count += 1
-                continue
-        
+                print(f"  Failed to download {genome_id}")
+            failed_count += 1
+            continue
+
         # Create symlink in taxonomy structure
         try:
             if flat:
@@ -180,7 +202,7 @@ def download_genomes_for_taxon(
 
             tax_folder.mkdir(parents=True, exist_ok=True)
 
-            link_path = tax_folder / genome_filename
+            link_path = tax_folder / genome_path.name
             if not link_path.exists():
                 link_path.symlink_to(genome_path.resolve())
                 if verbose:
@@ -209,11 +231,11 @@ Examples:
   # Download metadata for r226
   gtdb-dl --gtdb r226 --download
 
-  # Download all Firmicutes genomes
-  gtdb-dl --gtdb r226 --taxon "Firmicutes"
+  # Download all Bacillota genomes
+  gtdb-dl --gtdb r226 --taxon "Bacillota"
 
   # Download with verbose output
-  gtdb-dl --gtdb r226 --taxon "d__Bacteria;p__Firmicutes" -v
+  gtdb-dl --gtdb r226 --taxon "d__Bacteria;p__Bacillota" -v
 
   # Set custom base directory
   GTDBDL_DATA=/data/gtdb gtdb-dl --gtdb r226 --taxon "Archaea"
@@ -229,7 +251,7 @@ Examples:
     
     parser.add_argument(
         "--taxon",
-        help="Taxon to search for (e.g., 'Firmicutes' or full GTDB taxonomy path)"
+        help="Taxon to search for (e.g., 'Bacillota' or full GTDB taxonomy path)"
     )
     
     parser.add_argument(

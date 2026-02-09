@@ -3,7 +3,7 @@
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple, Dict
 
 
 def check_aria2c_available() -> bool:
@@ -137,13 +137,10 @@ def download_file_aria2(
         "-d", str(output_path.parent),
     ]
     
-    if not verbose:
-        cmd.append("--quiet")
-    
     cmd.append(url)
     
     try:
-        result = subprocess.run(cmd, capture_output=not verbose, text=True, timeout=3600)
+        result = subprocess.run(cmd, timeout=3600)
         return result.returncode == 0
     except subprocess.TimeoutExpired:
         print(f"Download timeout for {url}", file=sys.stderr)
@@ -151,6 +148,73 @@ def download_file_aria2(
     except Exception as e:
         print(f"Error downloading {url}: {e}", file=sys.stderr)
         return False
+
+
+def download_files_aria2(
+    downloads: List[Tuple[str, Path]],
+    max_connections: int = 4,
+    verbose: bool = False,
+    tmp_dir: Optional[Path] = None
+) -> Dict[Path, bool]:
+    """
+    Download multiple files in one aria2c invocation.
+
+    Args:
+        downloads: List of (url, output_path) items
+        max_connections: Number of parallel connections per file
+        verbose: Print verbose output
+        tmp_dir: Directory for aria2 input/session files
+
+    Returns:
+        Mapping from output_path to success status
+    """
+    results: Dict[Path, bool] = {}
+    if not downloads:
+        return results
+
+    for _, output_path in downloads:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        results[output_path] = output_path.exists()
+
+    if all(results.values()):
+        return results
+
+    work_dir = tmp_dir or (downloads[0][1].parent / ".tmp")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    input_file = work_dir / "aria2_batch.txt"
+
+    lines: List[str] = []
+    for url, output_path in downloads:
+        if output_path.exists():
+            continue
+        lines.append(url)
+        lines.append(f"  dir={output_path.parent}")
+        lines.append(f"  out={output_path.name}")
+        lines.append("")
+
+    input_file.write_text("\n".join(lines), encoding="utf-8")
+
+    cmd = [
+        "aria2c",
+        f"--max-connection-per-server={max_connections}",
+        f"--split={max_connections}",
+        "-x", str(max_connections),
+        "-k", "1M",
+        "--continue=true",
+        "--input-file", str(input_file),
+    ]
+
+    try:
+        subprocess.run(cmd, timeout=3600 * 24)
+    except subprocess.TimeoutExpired:
+        print("Download timeout while running aria2 batch download", file=sys.stderr)
+    except Exception as e:
+        print(f"Error running aria2 batch download: {e}", file=sys.stderr)
+
+    for _, output_path in downloads:
+        results[output_path] = output_path.exists()
+
+    return results
 
 
 def download_file_wget(url: str, output_path: Path, verbose: bool = False) -> bool:
