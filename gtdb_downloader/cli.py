@@ -3,7 +3,7 @@
 import argparse
 import sys
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 from gtdb_downloader.config import get_base_dir, GTDB_VERSIONS
 from gtdb_downloader.downloader import (
@@ -27,6 +27,15 @@ def _sanitize_name(name: str) -> str:
     return out
 
 
+def _get_symlink_name(genome_filename: str, is_species_rep: bool, flag_rep: bool) -> str:
+    """Return symlink filename, optionally tagging species representatives."""
+    if not (flag_rep and is_species_rep):
+        return genome_filename
+    if genome_filename.endswith(".fna.gz"):
+        return genome_filename[:-7] + ".speciesrep.fna.gz"
+    return genome_filename + ".speciesrep.fna.gz"
+
+
 def setup_version_dir(version: str, base_dir: Path) -> Path:
     """Setup directory for a specific GTDB version"""
     version_dir = base_dir / version
@@ -42,6 +51,7 @@ def download_genomes_for_taxon(
     base_dir: Optional[Path] = None,
     output_dir: Optional[Path] = None,
     flat: Optional[str] = None,
+    flag_rep: bool = False,
     verbose: bool = False,
     dry_run: bool = False
 ) -> bool:
@@ -114,7 +124,8 @@ def download_genomes_for_taxon(
         print("\n[DRY RUN] Download would proceed for the above genomes")
         return True
     
-    downloadable: List[Tuple[str, str, str, Path]] = []
+    downloadable: List[Tuple[str, str, str, Path, bool, str]] = []
+    representative_by_cluster: Dict[str, List[str]] = {}
     failed_count = 0
 
     for i, genome_id in enumerate(matching_genomes, 1):
@@ -147,13 +158,32 @@ def download_genomes_for_taxon(
             continue
 
         genome_path = genomes_dir / genome_filename
-        downloadable.append((genome_id, taxonomy_str, download_url, genome_path))
+        is_species_rep = parser.is_species_cluster_representative(genome_id)
+        cluster_rep = parser.get_species_cluster_representative(genome_id) or "unknown_cluster"
+        downloadable.append(
+            (genome_id, taxonomy_str, download_url, genome_path, is_species_rep, cluster_rep)
+        )
+
+        if flag_rep and is_species_rep:
+            representative_by_cluster.setdefault(cluster_rep, []).append(genome_id)
+
         if verbose and not genome_path.exists():
             print(f"  Queued download: {download_url}")
 
     missing_downloads: List[Tuple[str, Path]] = [
-        (url, genome_path) for _, _, url, genome_path in downloadable if not genome_path.exists()
+        (url, genome_path) for _, _, url, genome_path, _, _ in downloadable if not genome_path.exists()
     ]
+
+    if flag_rep:
+        for cluster_rep, rep_genomes in representative_by_cluster.items():
+            if len(rep_genomes) > 1:
+                print(
+                    (
+                        f"Warning: More than one genome qualifies as cluster representative "
+                        f"for {cluster_rep}: {', '.join(rep_genomes)}"
+                    ),
+                    file=sys.stderr,
+                )
 
     if missing_downloads:
         if check_aria2c_available():
@@ -175,7 +205,7 @@ def download_genomes_for_taxon(
         batch_results = {}
 
     downloaded_count = 0
-    for genome_id, taxonomy_str, _, genome_path in downloadable:
+    for genome_id, taxonomy_str, _, genome_path, is_species_rep, _ in downloadable:
         if not genome_path.exists() and not batch_results.get(genome_path, False):
             if verbose:
                 print(f"  Failed to download {genome_id}")
@@ -202,7 +232,8 @@ def download_genomes_for_taxon(
 
             tax_folder.mkdir(parents=True, exist_ok=True)
 
-            link_path = tax_folder / genome_path.name
+            link_name = _get_symlink_name(genome_path.name, is_species_rep, flag_rep)
+            link_path = tax_folder / link_name
             if not link_path.exists():
                 link_path.symlink_to(genome_path.resolve())
                 if verbose:
@@ -272,6 +303,12 @@ Examples:
         "--flat",
         choices=["domain","phylum","class","order","family","genus","species","d","p","c","o","f","g","s"],
         help="Create a flat symlink structure at the given rank (e.g. --flat species)")
+
+    parser.add_argument(
+        "--flag-rep",
+        action="store_true",
+        help="Append .speciesrep.fna.gz to symlinks for species-cluster representatives"
+    )
     
     parser.add_argument(
         "--output",
@@ -341,6 +378,7 @@ Examples:
             base_dir=base_dir,
             output_dir=args.output,
             flat=args.flat,
+            flag_rep=args.flag_rep,
             verbose=args.verbose,
             dry_run=args.dry_run
         )
