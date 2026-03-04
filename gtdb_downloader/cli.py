@@ -38,13 +38,6 @@ def _get_symlink_name(genome_filename: str, is_species_rep: bool, flag_rep: bool
     return genome_filename + ".speciesrep.fna.gz"
 
 
-def _write_mapping_file(mapping_path: Path, mappings: List[Tuple[str, Path]]) -> None:
-    """Write accession-to-file mappings as a tab-separated file."""
-    mapping_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"{accession}\t{genome_path}" for accession, genome_path in mappings]
-    mapping_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-
-
 def _get_default_mapping_path(base_dir: Path, version: str) -> Path:
     """Return the default accession-to-path mapping file location."""
     return base_dir / version / "accession_path_map.tsv"
@@ -60,27 +53,28 @@ def _resolve_mapping_path(base_dir: Path, version: str, mapping_file: Optional[P
     return default_path.parent / mapping_file
 
 
-def _collect_existing_genome_mappings(genomes_dir: Path) -> List[Tuple[str, Path]]:
+def _collect_existing_genome_mappings(genomes_dir: Path) -> Dict[str, Path]:
     """Scan the raw genome directory and build accession-to-path mappings."""
     mappings: Dict[str, Path] = {}
     pattern = re.compile(r"^(GC[AF]_\d+\.\d+)")
 
     if not genomes_dir.exists():
-        return []
+        return mappings
 
     for genome_path in sorted(genomes_dir.glob("*.fna.gz")):
         match = pattern.match(genome_path.name)
         if not match:
             continue
-        mappings[match.group(1)] = genome_path.resolve()
+        mappings[match.group(1)] = genome_path
 
-    return sorted(mappings.items())
+    return mappings
 
 
 def build_mapping_file(
     version: str,
     base_dir: Optional[Path] = None,
     mapping_file: Optional[Path] = None,
+    show_progress: bool = False,
 ) -> Path:
     """Create or refresh the accession-to-path mapping file from existing genomes."""
     if base_dir is None:
@@ -89,7 +83,22 @@ def build_mapping_file(
     genomes_dir = base_dir / version / "genomes" / "raw"
     resolved_mapping_path = _resolve_mapping_path(base_dir, version, mapping_file)
     mappings = _collect_existing_genome_mappings(genomes_dir)
-    _write_mapping_file(resolved_mapping_path, mappings)
+    resolved_mapping_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = resolved_mapping_path.with_suffix(resolved_mapping_path.suffix + ".tmp")
+
+    if show_progress:
+        print(f"Building mapping file from: {genomes_dir}")
+
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        for count, (accession, genome_path) in enumerate(sorted(mappings.items()), start=1):
+            handle.write(f"{accession}\t{genome_path}\n")
+            if show_progress and count % 1000 == 0:
+                print(f"  Mapped {count} genomes...")
+
+    tmp_path.replace(resolved_mapping_path)
+
+    if show_progress:
+        print(f"Finished mapping {len(mappings)} genomes")
     return resolved_mapping_path
 
 
@@ -399,7 +408,7 @@ def download_genomes_for_taxon(
         
         downloaded_count += 1
 
-    mapping_path = build_mapping_file(version, base_dir=base_dir)
+    mapping_path = build_mapping_file(version, base_dir=base_dir, show_progress=verbose)
     print(f"Mapping file written to: {mapping_path}")
     
     print(f"\n✓ Downloaded: {downloaded_count}")
@@ -523,6 +532,7 @@ Examples:
             args.gtdb,
             base_dir=base_dir,
             mapping_file=args.mapping_file,
+            show_progress=True,
         )
         count = len(_collect_existing_genome_mappings(base_dir / args.gtdb / "genomes" / "raw"))
         print(f"Mapping file written to: {mapping_path}")
@@ -567,6 +577,7 @@ Examples:
                 args.gtdb,
                 base_dir=base_dir,
                 mapping_file=args.mapping_file,
+                show_progress=True,
             )
             print(f"Requested mapping file written to: {mapping_path}")
         return 0 if success else 1
