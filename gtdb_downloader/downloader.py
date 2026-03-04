@@ -37,7 +37,7 @@ def check_wget_available() -> bool:
         return False
 
 
-def generate_download_link(genome_metadata: dict) -> str:
+def generate_download_link(genome_metadata: dict, accession_override: Optional[str] = None) -> str:
     """
     Generate a download link for a specific genome from NCBI
     
@@ -50,7 +50,7 @@ def generate_download_link(genome_metadata: dict) -> str:
     Raises:
         ValueError: If required fields are missing
     """
-    accession = genome_metadata.get("accession")
+    accession = accession_override or genome_metadata.get("accession")
     assembly_name = genome_metadata.get("ncbi_assembly_name")
     
     if not accession or not assembly_name:
@@ -160,6 +160,21 @@ def _get_accession_variants(accession: str) -> List[str]:
     return list(reversed(variants))
 
 
+def generate_download_links(genome_metadata: dict, ignore_prefix: bool = False) -> List[str]:
+    """Generate candidate genome download links, optionally trying both GCA/GCF prefixes."""
+    accession = genome_metadata.get("accession")
+    if not accession:
+        raise ValueError("Missing accession in genome metadata")
+
+    variants = _get_accession_variants(accession) if ignore_prefix else [_normalize_accession(accession)]
+    urls: List[str] = []
+    for variant in variants:
+        url = generate_download_link(genome_metadata, accession_override=variant)
+        if url not in urls:
+            urls.append(url)
+    return urls
+
+
 def _url_exists(url: str, timeout: int = 15) -> bool:
     """Check whether a URL exists without downloading the full payload."""
     try:
@@ -184,7 +199,11 @@ def _list_ncbi_directory(url: str, timeout: int = 15) -> List[str]:
     return re.findall(r'href="([^"]+)"', response.text)
 
 
-def resolve_download_link(genome_metadata: dict, verbose: bool = False) -> str:
+def resolve_download_link(
+    genome_metadata: dict,
+    verbose: bool = False,
+    ignore_prefix: bool = False,
+) -> str:
     """
     Resolve a working NCBI genome download link.
 
@@ -192,16 +211,21 @@ def resolve_download_link(genome_metadata: dict, verbose: bool = False) -> str:
     accession directory when the metadata assembly name does not match the
     actual NCBI folder name.
     """
-    url = generate_download_link(genome_metadata)
-    if _url_exists(url):
-        return url
-
     accession = genome_metadata.get("accession")
     if not accession:
         raise ValueError("Missing accession in genome metadata")
 
+    for url in generate_download_links(genome_metadata, ignore_prefix=ignore_prefix):
+        if _url_exists(url):
+            return url
+
     errors: List[str] = []
-    for accession_variant in _get_accession_variants(accession):
+    accession_variants = (
+        _get_accession_variants(accession)
+        if ignore_prefix
+        else [_normalize_accession(accession)]
+    )
+    for accession_variant in accession_variants:
         accession_dir, acc = _get_accession_directory(accession_variant)
         accepted_prefixes = tuple(f"{variant}_" for variant in _get_accession_variants(accession_variant))
         if verbose:
@@ -244,7 +268,7 @@ def resolve_download_link(genome_metadata: dict, verbose: bool = False) -> str:
 
     raise ValueError(
         "Could not resolve a genome download file for accession variants "
-        f"{', '.join(_get_accession_variants(accession))}. "
+        f"{', '.join(accession_variants)}. "
         f"Probe errors: {'; '.join(errors) if errors else 'none'}"
     )
 

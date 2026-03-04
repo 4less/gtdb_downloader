@@ -12,7 +12,7 @@ from gtdb_downloader.downloader import (
     download_file,
     download_files_aria2,
     download_metadata,
-    generate_download_link,
+    generate_download_links,
     resolve_download_link,
 )
 from gtdb_downloader.metadata import MetadataParser
@@ -107,6 +107,40 @@ def _chunked(items: List[Dict[str, object]], chunk_size: int) -> List[List[Dict[
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
+def _get_accession_keys(accession: str, ignore_prefix: bool) -> List[str]:
+    """Return accession keys to use for local lookup."""
+    if ignore_prefix and accession.startswith(("GCA_", "GCF_")):
+        return [accession[4:]]
+    return [accession]
+
+
+def _index_existing_genomes(genomes_dir: Path, ignore_prefix: bool) -> Dict[str, Path]:
+    """Index existing raw genomes by accession for fast presence checks."""
+    indexed: Dict[str, Path] = {}
+    for accession, genome_path in _collect_existing_genome_mappings(genomes_dir).items():
+        for key in _get_accession_keys(accession, ignore_prefix):
+            indexed.setdefault(key, genome_path)
+    return indexed
+
+
+def _find_existing_genome_path(
+    existing_genomes: Dict[str, Path],
+    genome_metadata: dict,
+    ignore_prefix: bool,
+) -> Optional[Path]:
+    """Return an existing local genome path, optionally ignoring GCA/GCF prefix differences."""
+    accession = genome_metadata.get("accession")
+    if not accession:
+        return None
+
+    normalized = accession[3:] if accession.startswith(("RS_", "GB_")) else accession
+    for key in _get_accession_keys(normalized, ignore_prefix):
+        path = existing_genomes.get(key)
+        if path is not None and path.exists():
+            return path
+    return None
+
+
 def setup_version_dir(version: str, base_dir: Path) -> Path:
     """Setup directory for a specific GTDB version"""
     version_dir = base_dir / version
@@ -123,6 +157,7 @@ def download_genomes_for_taxon(
     output_dir: Optional[Path] = None,
     flat: Optional[str] = None,
     flag_rep: bool = False,
+    ignore_prefix: bool = False,
     verbose: bool = False,
     dry_run: bool = False
 ) -> bool:
@@ -198,6 +233,7 @@ def download_genomes_for_taxon(
     downloadable: List[Dict[str, object]] = []
     representative_by_cluster: Dict[str, List[str]] = {}
     failed_count = 0
+    existing_genomes = _index_existing_genomes(genomes_dir, ignore_prefix)
 
     for i, genome_id in enumerate(matching_genomes, 1):
         if verbose:
@@ -220,7 +256,8 @@ def download_genomes_for_taxon(
         taxonomy_str, _ = tax_info
 
         try:
-            download_url = generate_download_link(genome_metadata)
+            download_urls = generate_download_links(genome_metadata, ignore_prefix=ignore_prefix)
+            download_url = download_urls[0]
             genome_filename = download_url.split("/")[-1]
         except Exception as e:
             if verbose:
@@ -229,6 +266,9 @@ def download_genomes_for_taxon(
             continue
 
         genome_path = genomes_dir / genome_filename
+        existing_genome_path = _find_existing_genome_path(existing_genomes, genome_metadata, ignore_prefix)
+        if existing_genome_path is not None:
+            genome_path = existing_genome_path
         is_species_rep = parser.is_species_cluster_representative(genome_id)
         cluster_rep = parser.get_species_cluster_representative(genome_id) or "unknown_cluster"
         downloadable.append({
@@ -239,6 +279,7 @@ def download_genomes_for_taxon(
             "is_species_rep": is_species_rep,
             "cluster_rep": cluster_rep,
             "genome_metadata": genome_metadata,
+            "download_urls": download_urls,
         })
 
         if flag_rep and is_species_rep:
@@ -279,7 +320,10 @@ def download_genomes_for_taxon(
             )
 
             primary_downloads: List[Tuple[str, Path]] = [
-                (item["download_url"], item["genome_path"])  # type: ignore[arg-type]
+                (
+                    item["download_urls"][0],  # type: ignore[index]
+                    item["genome_path"],
+                )
                 for item in chunk
                 if not item["genome_path"].exists()  # type: ignore[union-attr]
             ]
@@ -324,11 +368,20 @@ def download_genomes_for_taxon(
                     print(f"  Resolving fallback for {genome_id}...")
 
                 try:
-                    fallback_url = resolve_download_link(genome_metadata, verbose=verbose)  # type: ignore[arg-type]
+                    fallback_url = resolve_download_link(
+                        genome_metadata,
+                        verbose=verbose,
+                        ignore_prefix=ignore_prefix,
+                    )  # type: ignore[arg-type]
                     fallback_filename = fallback_url.split("/")[-1]
                     fallback_path = genomes_dir / fallback_filename
                     item["download_url"] = fallback_url
                     item["genome_path"] = fallback_path
+                    fallback_accession = fallback_filename.split("_genomic.fna.gz", 1)[0].split("_", 2)
+                    if len(fallback_accession) >= 2:
+                        normalized_accession = "_".join(fallback_accession[:2])
+                        for key in _get_accession_keys(normalized_accession, ignore_prefix):
+                            existing_genomes[key] = fallback_path
                     print(f"  Fallback resolved for {genome_id}: {fallback_filename}")
                 except Exception as e:
                     if verbose:
@@ -476,6 +529,12 @@ Examples:
         action="store_true",
         help="Append .speciesrep.fna.gz to symlinks for species-cluster representatives"
     )
+
+    parser.add_argument(
+        "--ignore-prefix",
+        action="store_true",
+        help="Treat GCA_ and GCF_ accession prefixes as interchangeable for local file checks and URL resolution"
+    )
     
     parser.add_argument(
         "--output",
@@ -569,6 +628,7 @@ Examples:
             output_dir=args.output,
             flat=args.flat,
             flag_rep=args.flag_rep,
+            ignore_prefix=args.ignore_prefix,
             verbose=args.verbose,
             dry_run=args.dry_run
         )
