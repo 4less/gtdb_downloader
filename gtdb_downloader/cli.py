@@ -11,7 +11,7 @@ from gtdb_downloader.downloader import (
     download_file,
     download_files_aria2,
     download_metadata,
-    generate_download_link,
+    resolve_download_link,
 )
 from gtdb_downloader.metadata import MetadataParser
 
@@ -149,7 +149,7 @@ def download_genomes_for_taxon(
         taxonomy_str, _ = tax_info
 
         try:
-            download_url = generate_download_link(genome_metadata)
+            download_url = resolve_download_link(genome_metadata, verbose=verbose)
             genome_filename = download_url.split("/")[-1]
         except Exception as e:
             if verbose:

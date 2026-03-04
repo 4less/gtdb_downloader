@@ -1,9 +1,12 @@
 """Download utilities for GTDB"""
 
+import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
+
+import requests
 
 
 def check_aria2c_available() -> bool:
@@ -105,6 +108,126 @@ def generate_download_link(genome_metadata: dict) -> str:
     url = f"{dir_path}/{filename}"
     
     return url
+
+
+def _normalize_accession(accession: str) -> str:
+    """Normalize GTDB accessions to bare NCBI accessions."""
+    if accession.startswith(("RS_", "GB_")):
+        return accession[3:]
+    return accession
+
+
+def _get_accession_directory(accession: str) -> Tuple[str, str]:
+    """
+    Return the FTP parent directory for an accession and its normalized value.
+
+    Example:
+        RS_GCF_900110215.1 -> (
+            "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/900/110/215",
+            "GCF_900110215.1",
+        )
+    """
+    acc = _normalize_accession(accession)
+    if not acc.startswith(("GCA_", "GCF_")):
+        raise ValueError(f"Unknown accession format: {acc}")
+
+    parts = acc.split("_")
+    if len(parts) < 2:
+        raise ValueError(f"Invalid accession format: {acc}")
+
+    numeric_id = parts[1].split(".")[0]
+    d1 = numeric_id[:3]
+    d2 = numeric_id[3:6] if len(numeric_id) >= 6 else ""
+    d3 = numeric_id[6:] if len(numeric_id) > 6 else ""
+    if not d2 or not d3:
+        raise ValueError(f"Accession numeric ID too short: {numeric_id}")
+
+    prefix = acc.split("_")[0]
+    base_url = "https://ftp.ncbi.nlm.nih.gov/genomes/all"
+    return f"{base_url}/{prefix}/{d1}/{d2}/{d3}", acc
+
+
+def _url_exists(url: str, timeout: int = 15) -> bool:
+    """Check whether a URL exists without downloading the full payload."""
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=timeout)
+        if response.status_code == 200:
+            return True
+        if response.status_code in (403, 405):
+            response = requests.get(url, stream=True, timeout=timeout)
+            try:
+                return response.status_code == 200
+            finally:
+                response.close()
+        return False
+    except requests.RequestException:
+        return False
+
+
+def _list_ncbi_directory(url: str, timeout: int = 15) -> List[str]:
+    """Return href targets from a simple NCBI FTP directory index page."""
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return re.findall(r'href="([^"]+)"', response.text)
+
+
+def resolve_download_link(genome_metadata: dict, verbose: bool = False) -> str:
+    """
+    Resolve a working NCBI genome download link.
+
+    Starts with the direct synthesized URL and falls back to listing the
+    accession directory when the metadata assembly name does not match the
+    actual NCBI folder name.
+    """
+    url = generate_download_link(genome_metadata)
+    if _url_exists(url):
+        return url
+
+    accession = genome_metadata.get("accession")
+    if not accession:
+        raise ValueError("Missing accession in genome metadata")
+
+    accession_dir, acc = _get_accession_directory(accession)
+    if verbose:
+        print(f"Primary URL missing for {acc}; probing {accession_dir}")
+
+    try:
+        hrefs = _list_ncbi_directory(accession_dir)
+    except requests.RequestException as e:
+        raise ValueError(f"Could not inspect accession directory for {acc}: {e}") from e
+
+    candidate_dirs: List[str] = []
+    for href in hrefs:
+        name = href.strip().strip("/")
+        if not name or name in (".", ".."):
+            continue
+        if not name.startswith(f"{acc}_"):
+            continue
+        candidate_dirs.append(name)
+
+    for candidate_dir in candidate_dirs:
+        candidate_url = f"{accession_dir}/{candidate_dir}/{candidate_dir}_genomic.fna.gz"
+        if _url_exists(candidate_url):
+            if verbose:
+                print(f"Resolved fallback URL for {acc}: {candidate_url}")
+            return candidate_url
+
+        try:
+            file_hrefs = _list_ncbi_directory(f"{accession_dir}/{candidate_dir}")
+        except requests.RequestException:
+            continue
+
+        for href in file_hrefs:
+            filename = href.strip().strip("/")
+            if filename.endswith("_genomic.fna.gz"):
+                resolved = f"{accession_dir}/{candidate_dir}/{filename}"
+                if verbose:
+                    print(f"Resolved fallback URL for {acc}: {resolved}")
+                return resolved
+
+    raise ValueError(
+        f"Could not resolve a genome download file under {accession_dir} for accession {acc}"
+    )
 
 
 def download_file_aria2(
