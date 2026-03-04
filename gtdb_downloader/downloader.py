@@ -147,6 +147,19 @@ def _get_accession_directory(accession: str) -> Tuple[str, str]:
     return f"{base_url}/{prefix}/{d1}/{d2}/{d3}", acc
 
 
+def _get_accession_variants(accession: str) -> List[str]:
+    """Return equivalent GCA/GCF accession variants for fallback probing."""
+    acc = _normalize_accession(accession)
+    if not acc.startswith(("GCA_", "GCF_")):
+        raise ValueError(f"Unknown accession format: {acc}")
+
+    suffix = acc[4:]
+    variants = [f"GCA_{suffix}", f"GCF_{suffix}"]
+    if acc.startswith("GCA_"):
+        return variants
+    return list(reversed(variants))
+
+
 def _url_exists(url: str, timeout: int = 15) -> bool:
     """Check whether a URL exists without downloading the full payload."""
     try:
@@ -187,46 +200,52 @@ def resolve_download_link(genome_metadata: dict, verbose: bool = False) -> str:
     if not accession:
         raise ValueError("Missing accession in genome metadata")
 
-    accession_dir, acc = _get_accession_directory(accession)
-    if verbose:
-        print(f"Primary URL missing for {acc}; probing {accession_dir}")
-
-    try:
-        hrefs = _list_ncbi_directory(accession_dir)
-    except requests.RequestException as e:
-        raise ValueError(f"Could not inspect accession directory for {acc}: {e}") from e
-
-    candidate_dirs: List[str] = []
-    for href in hrefs:
-        name = href.strip().strip("/")
-        if not name or name in (".", ".."):
-            continue
-        if not name.startswith(f"{acc}_"):
-            continue
-        candidate_dirs.append(name)
-
-    for candidate_dir in candidate_dirs:
-        candidate_url = f"{accession_dir}/{candidate_dir}/{candidate_dir}_genomic.fna.gz"
-        if _url_exists(candidate_url):
-            if verbose:
-                print(f"Resolved fallback URL for {acc}: {candidate_url}")
-            return candidate_url
+    errors: List[str] = []
+    for accession_variant in _get_accession_variants(accession):
+        accession_dir, acc = _get_accession_directory(accession_variant)
+        accepted_prefixes = tuple(f"{variant}_" for variant in _get_accession_variants(accession_variant))
+        if verbose:
+            print(f"Primary URL missing for {acc}; probing {accession_dir}")
 
         try:
-            file_hrefs = _list_ncbi_directory(f"{accession_dir}/{candidate_dir}")
-        except requests.RequestException:
+            hrefs = _list_ncbi_directory(accession_dir)
+        except requests.RequestException as e:
+            errors.append(f"{acc}: {e}")
             continue
 
-        for href in file_hrefs:
-            filename = href.strip().strip("/")
-            if filename.endswith("_genomic.fna.gz"):
-                resolved = f"{accession_dir}/{candidate_dir}/{filename}"
+        candidate_dirs: List[str] = []
+        for href in hrefs:
+            name = href.strip().strip("/")
+            if not name or name in (".", ".."):
+                continue
+            if not name.startswith(accepted_prefixes):
+                continue
+            candidate_dirs.append(name)
+
+        for candidate_dir in candidate_dirs:
+            candidate_url = f"{accession_dir}/{candidate_dir}/{candidate_dir}_genomic.fna.gz"
+            if _url_exists(candidate_url):
                 if verbose:
-                    print(f"Resolved fallback URL for {acc}: {resolved}")
-                return resolved
+                    print(f"Resolved fallback URL for {acc}: {candidate_url}")
+                return candidate_url
+
+            try:
+                file_hrefs = _list_ncbi_directory(f"{accession_dir}/{candidate_dir}")
+            except requests.RequestException:
+                continue
+
+            for href in file_hrefs:
+                filename = href.strip().strip("/")
+                if filename.endswith("_genomic.fna.gz"):
+                    resolved = f"{accession_dir}/{candidate_dir}/{filename}"
+                    if verbose:
+                        print(f"Resolved fallback URL for {acc}: {resolved}")
+                    return resolved
 
     raise ValueError(
-        f"Could not resolve a genome download file under {accession_dir} for accession {acc}"
+        "Could not resolve a genome download file for accession variants "
+        f"{', '.join(_get_accession_variants(accession))}. "
+        f"Probe errors: {'; '.join(errors) if errors else 'none'}"
     )
 
 
