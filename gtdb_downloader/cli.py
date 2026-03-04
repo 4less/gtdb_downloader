@@ -10,7 +10,6 @@ from gtdb_downloader.config import get_base_dir, GTDB_VERSIONS
 from gtdb_downloader.downloader import (
     check_aria2c_available,
     download_file,
-    download_files_aria2,
     download_metadata,
     generate_download_link,
     resolve_download_link,
@@ -233,12 +232,6 @@ def download_genomes_for_taxon(
         if verbose and not genome_path.exists():
             print(f"  Queued download: {download_url}")
 
-    missing_downloads: List[Tuple[str, Path]] = [
-        (item["download_url"], item["genome_path"])  # type: ignore[arg-type]
-        for item in downloadable
-        if not item["genome_path"].exists()  # type: ignore[union-attr]
-    ]
-
     if flag_rep:
         for cluster_rep, rep_genomes in representative_by_cluster.items():
             if len(rep_genomes) > 1:
@@ -250,40 +243,35 @@ def download_genomes_for_taxon(
                     file=sys.stderr,
                 )
 
-    if missing_downloads:
-        if check_aria2c_available():
-            tmp_dir = genomes_dir / ".tmp"
-            print(f"\nStarting batch download of {len(missing_downloads)} genomes with aria2c...")
-            if verbose:
-                print(f"aria2 temp/session dir: {tmp_dir}")
-            batch_results = download_files_aria2(
-                missing_downloads,
-                verbose=verbose,
-                tmp_dir=tmp_dir,
-            )
-        else:
-            print(f"\naria2c not found; downloading {len(missing_downloads)} genomes sequentially with wget...")
-            batch_results = {}
-            for url, genome_path in missing_downloads:
-                batch_results[genome_path] = download_file(url, genome_path, verbose=verbose, use_aria2=False)
-    else:
-        batch_results = {}
-
-    failed_downloads: List[Dict[str, object]] = [
-        item
-        for item in downloadable
-        if not item["genome_path"].exists() and not batch_results.get(item["genome_path"], False)  # type: ignore[union-attr]
+    batch_results: Dict[Path, bool] = {}
+    pending_downloads = [
+        item for item in downloadable if not item["genome_path"].exists()  # type: ignore[union-attr]
     ]
 
-    if failed_downloads:
-        print(f"\nRetrying {len(failed_downloads)} failed genomes with fallback URL resolution...")
+    if pending_downloads:
+        downloader_name = "aria2c" if check_aria2c_available() else "wget"
+        print(
+            f"\nStarting download of {len(pending_downloads)} genomes with immediate fallback retries using {downloader_name}..."
+        )
 
-    for item in failed_downloads:
+    for item in pending_downloads:
         genome_id = item["genome_id"]
-        genome_metadata = item["genome_metadata"]
-        if verbose:
-            print(f"  Retrying {genome_id}...")
+        download_url = item["download_url"]
+        genome_path = item["genome_path"]
 
+        if verbose:
+            print(f"  Downloading {genome_id}...")
+
+        success = download_file(download_url, genome_path, verbose=verbose)
+        batch_results[genome_path] = success
+
+        if success or genome_path.exists():
+            continue
+
+        if verbose:
+            print(f"  Primary download failed for {genome_id}; resolving fallback...")
+
+        genome_metadata = item["genome_metadata"]
         try:
             fallback_url = resolve_download_link(genome_metadata, verbose=verbose)  # type: ignore[arg-type]
             fallback_filename = fallback_url.split("/")[-1]
