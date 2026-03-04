@@ -320,6 +320,7 @@ def download_genomes_for_taxon(
                     fallback_path = genomes_dir / fallback_filename
                     item["download_url"] = fallback_url
                     item["genome_path"] = fallback_path
+                    print(f"  Fallback resolved for {genome_id}: {fallback_filename}")
                 except Exception as e:
                     if verbose:
                         print(f"  Fallback resolution failed for {genome_id}: {e}")
