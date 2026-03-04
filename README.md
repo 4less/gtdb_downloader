@@ -8,11 +8,12 @@ This script was developed with the help of ChatGPT.
 ## Features
 
 - Download GTDB metadata and genomes for multiple versions (r207, r214, r220, r226)
-- Search for genomes by taxon name
+- Search for genomes by exact taxon name/component
 - Automatic metadata download on first use
 - Multiple mirror support (Europe, Asia-Pacific)
 - Download genomes using aria2 (with wget fallback)
 - Store genomes in a single folder with taxonomy-based symlink structure
+- Maintain an accession-to-path mapping TSV for downloaded raw genomes
 - Custom base directory support via environment variable
 
 ## Installation
@@ -74,10 +75,10 @@ gtdb-dl --gtdb r226 --download --mirror asia-pacific1
 ### Download all genomes for a taxon
 
 ```bash
-# Search by simple taxon name
+# Search by exact taxon name (exact component match)
 gtdb-dl --gtdb r226 --taxon "Bacillota"
 
-# Full GTDB taxonomy path
+# GTDB taxonomy path (exact ordered component match from domain onward)
 gtdb-dl --gtdb r226 --taxon "d__Bacteria;p__Bacillota;c__Clostridia"
 
 # With verbose output
@@ -91,6 +92,15 @@ gtdb-dl --gtdb r226 --taxon "Bacillota" --mirror asia-pacific2
 
 # Create symlink structure in custom directory
 gtdb-dl --gtdb r226 --taxon "Bacillota" --output /path/to/my_project/genomes
+
+# Tag species representatives in symlink names
+gtdb-dl --gtdb r226 --taxon "Bacillota" --flag-rep
+
+# Rebuild accession-to-path mapping TSV from existing downloaded genomes
+gtdb-dl --gtdb r226 --mapping-file
+
+# Write mapping TSV to a custom path
+gtdb-dl --gtdb r226 --mapping-file /path/to/accession_path_map.tsv
 ```
 
 ### Custom base directory
@@ -156,13 +166,18 @@ With `--output /path/to/my_project`:
 - **Multiple projects**: Each project can have its own taxonomy-organized folder
 - **Easy browsing**: Navigate through taxonomy hierarchy without file duplication
 - **Metadata file**: `~/.gtdb_downloader/r226/bac120_metadata_r226.tsv.gz`
+- **Mapping file**: `~/.gtdb_downloader/r226/accession_path_map.tsv`
+
+The accession mapping file is rebuilt from the actual contents of `genomes/raw/` after taxon downloads, so it reflects files that exist locally rather than predicted URLs.
 
 ## Command Reference
 
 ```
 usage: gtdb-dl [-h] --gtdb {r207,r214,r220,r226} [--taxon TAXON]
                [--dataset {bac120,ar53}] [--mirror {europe,asia-pacific1,asia-pacific2}]
-               [--output OUTPUT] [--download] [--verbose] [--dry-run]
+               [--flat {domain,phylum,class,order,family,genus,species,d,p,c,o,f,g,s}]
+               [--flag-rep] [--output OUTPUT] [--mapping-file [MAPPING_FILE]]
+               [--download] [--verbose] [--dry-run]
                [--base-dir BASE_DIR]
 
 optional arguments:
@@ -171,7 +186,11 @@ optional arguments:
   --taxon TAXON                           Taxon to search for
   --dataset {bac120,ar53}                 Dataset type (default: bac120)
   --mirror {europe,asia-pacific1,asia-pacific2}  Mirror to download from (default: europe)
+  --flat {domain,phylum,class,order,family,genus,species,d,p,c,o,f,g,s}
+                                          Create a flat symlink structure at given rank
+  --flag-rep                              Append .speciesrep.fna.gz to symlinks for species-cluster representatives
   --output OUTPUT, -o OUTPUT              Output directory for symlink taxonomy structure
+  --mapping-file [MAPPING_FILE]           Write or refresh accession-to-path TSV from existing raw genomes
   --download                              Only download metadata, don't download genomes
   --verbose, -v                          Verbose output
   --dry-run                               Show what would be downloaded

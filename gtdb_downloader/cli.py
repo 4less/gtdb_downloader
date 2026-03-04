@@ -1,6 +1,7 @@
 """Command-line interface for GTDB downloader"""
 
 import argparse
+import re
 import sys
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
@@ -34,6 +35,61 @@ def _get_symlink_name(genome_filename: str, is_species_rep: bool, flag_rep: bool
     if genome_filename.endswith(".fna.gz"):
         return genome_filename[:-7] + ".speciesrep.fna.gz"
     return genome_filename + ".speciesrep.fna.gz"
+
+
+def _write_mapping_file(mapping_path: Path, mappings: List[Tuple[str, Path]]) -> None:
+    """Write accession-to-file mappings as a tab-separated file."""
+    mapping_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{accession}\t{genome_path}" for accession, genome_path in mappings]
+    mapping_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _get_default_mapping_path(base_dir: Path, version: str) -> Path:
+    """Return the default accession-to-path mapping file location."""
+    return base_dir / version / "accession_path_map.tsv"
+
+
+def _resolve_mapping_path(base_dir: Path, version: str, mapping_file: Optional[Path]) -> Path:
+    """Resolve mapping file path, using the default location when omitted or relative."""
+    default_path = _get_default_mapping_path(base_dir, version)
+    if mapping_file is None:
+        return default_path
+    if mapping_file.is_absolute():
+        return mapping_file
+    return default_path.parent / mapping_file
+
+
+def _collect_existing_genome_mappings(genomes_dir: Path) -> List[Tuple[str, Path]]:
+    """Scan the raw genome directory and build accession-to-path mappings."""
+    mappings: Dict[str, Path] = {}
+    pattern = re.compile(r"^(GC[AF]_\d+\.\d+)")
+
+    if not genomes_dir.exists():
+        return []
+
+    for genome_path in sorted(genomes_dir.glob("*.fna.gz")):
+        match = pattern.match(genome_path.name)
+        if not match:
+            continue
+        mappings[match.group(1)] = genome_path.resolve()
+
+    return sorted(mappings.items())
+
+
+def build_mapping_file(
+    version: str,
+    base_dir: Optional[Path] = None,
+    mapping_file: Optional[Path] = None,
+) -> Path:
+    """Create or refresh the accession-to-path mapping file from existing genomes."""
+    if base_dir is None:
+        base_dir = get_base_dir()
+
+    genomes_dir = base_dir / version / "genomes" / "raw"
+    resolved_mapping_path = _resolve_mapping_path(base_dir, version, mapping_file)
+    mappings = _collect_existing_genome_mappings(genomes_dir)
+    _write_mapping_file(resolved_mapping_path, mappings)
+    return resolved_mapping_path
 
 
 def setup_version_dir(version: str, base_dir: Path) -> Path:
@@ -243,6 +299,9 @@ def download_genomes_for_taxon(
                 print(f"  Warning: Could not create symlink: {e}")
         
         downloaded_count += 1
+
+    mapping_path = build_mapping_file(version, base_dir=base_dir)
+    print(f"Mapping file written to: {mapping_path}")
     
     print(f"\n✓ Downloaded: {downloaded_count}")
     print(f"✗ Failed: {failed_count}")
@@ -316,6 +375,17 @@ Examples:
         type=Path,
         help="Output directory for symlink taxonomy structure (default: ~/.gtdb_downloader/{version}/genomes/taxonomy)"
     )
+
+    parser.add_argument(
+        "--mapping-file",
+        nargs="?",
+        const=Path("accession_path_map.tsv"),
+        type=Path,
+        help=(
+            "Write or refresh a TSV mapping file of accession to local raw genome path. "
+            "Can be used without --taxon to build the mapping from existing downloaded genomes."
+        )
+    )
     
     parser.add_argument(
         "--download",
@@ -348,6 +418,17 @@ Examples:
     
     if args.verbose:
         print(f"Using base directory: {base_dir}")
+
+    if args.mapping_file is not None and not args.taxon and not args.download:
+        mapping_path = build_mapping_file(
+            args.gtdb,
+            base_dir=base_dir,
+            mapping_file=args.mapping_file,
+        )
+        count = len(_collect_existing_genome_mappings(base_dir / args.gtdb / "genomes" / "raw"))
+        print(f"Mapping file written to: {mapping_path}")
+        print(f"Mapped genomes: {count}")
+        return 0
     
     # Handle --download flag (metadata only)
     if args.download:
@@ -382,8 +463,15 @@ Examples:
             verbose=args.verbose,
             dry_run=args.dry_run
         )
+        if args.mapping_file is not None:
+            mapping_path = build_mapping_file(
+                args.gtdb,
+                base_dir=base_dir,
+                mapping_file=args.mapping_file,
+            )
+            print(f"Requested mapping file written to: {mapping_path}")
         return 0 if success else 1
-    
+
     # If neither --download nor --taxon, show help
     parser.print_help()
     return 1
