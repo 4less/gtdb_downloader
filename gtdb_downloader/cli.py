@@ -12,6 +12,7 @@ from gtdb_downloader.downloader import (
     download_file,
     download_files_aria2,
     download_metadata,
+    generate_download_link,
     resolve_download_link,
 )
 from gtdb_downloader.metadata import MetadataParser
@@ -180,7 +181,7 @@ def download_genomes_for_taxon(
         print("\n[DRY RUN] Download would proceed for the above genomes")
         return True
     
-    downloadable: List[Tuple[str, str, str, Path, bool, str]] = []
+    downloadable: List[Dict[str, object]] = []
     representative_by_cluster: Dict[str, List[str]] = {}
     failed_count = 0
 
@@ -205,7 +206,7 @@ def download_genomes_for_taxon(
         taxonomy_str, _ = tax_info
 
         try:
-            download_url = resolve_download_link(genome_metadata, verbose=verbose)
+            download_url = generate_download_link(genome_metadata)
             genome_filename = download_url.split("/")[-1]
         except Exception as e:
             if verbose:
@@ -216,9 +217,15 @@ def download_genomes_for_taxon(
         genome_path = genomes_dir / genome_filename
         is_species_rep = parser.is_species_cluster_representative(genome_id)
         cluster_rep = parser.get_species_cluster_representative(genome_id) or "unknown_cluster"
-        downloadable.append(
-            (genome_id, taxonomy_str, download_url, genome_path, is_species_rep, cluster_rep)
-        )
+        downloadable.append({
+            "genome_id": genome_id,
+            "taxonomy_str": taxonomy_str,
+            "download_url": download_url,
+            "genome_path": genome_path,
+            "is_species_rep": is_species_rep,
+            "cluster_rep": cluster_rep,
+            "genome_metadata": genome_metadata,
+        })
 
         if flag_rep and is_species_rep:
             representative_by_cluster.setdefault(cluster_rep, []).append(genome_id)
@@ -227,7 +234,9 @@ def download_genomes_for_taxon(
             print(f"  Queued download: {download_url}")
 
     missing_downloads: List[Tuple[str, Path]] = [
-        (url, genome_path) for _, _, url, genome_path, _, _ in downloadable if not genome_path.exists()
+        (item["download_url"], item["genome_path"])  # type: ignore[arg-type]
+        for item in downloadable
+        if not item["genome_path"].exists()  # type: ignore[union-attr]
     ]
 
     if flag_rep:
@@ -260,8 +269,49 @@ def download_genomes_for_taxon(
     else:
         batch_results = {}
 
+    failed_downloads: List[Dict[str, object]] = [
+        item
+        for item in downloadable
+        if not item["genome_path"].exists() and not batch_results.get(item["genome_path"], False)  # type: ignore[union-attr]
+    ]
+
+    if failed_downloads:
+        print(f"\nRetrying {len(failed_downloads)} failed genomes with fallback URL resolution...")
+
+    for item in failed_downloads:
+        genome_id = item["genome_id"]
+        genome_metadata = item["genome_metadata"]
+        if verbose:
+            print(f"  Retrying {genome_id}...")
+
+        try:
+            fallback_url = resolve_download_link(genome_metadata, verbose=verbose)  # type: ignore[arg-type]
+            fallback_filename = fallback_url.split("/")[-1]
+            fallback_path = genomes_dir / fallback_filename
+            item["download_url"] = fallback_url
+            item["genome_path"] = fallback_path
+        except Exception as e:
+            if verbose:
+                print(f"  Fallback resolution failed for {genome_id}: {e}")
+            continue
+
+        if fallback_path.exists():
+            batch_results[fallback_path] = True
+            continue
+
+        batch_results[fallback_path] = download_file(
+            fallback_url,
+            fallback_path,
+            verbose=verbose,
+        )
+
     downloaded_count = 0
-    for genome_id, taxonomy_str, _, genome_path, is_species_rep, _ in downloadable:
+    for item in downloadable:
+        genome_id = item["genome_id"]
+        taxonomy_str = item["taxonomy_str"]
+        genome_path = item["genome_path"]
+        is_species_rep = item["is_species_rep"]
+
         if not genome_path.exists() and not batch_results.get(genome_path, False):
             if verbose:
                 print(f"  Failed to download {genome_id}")
