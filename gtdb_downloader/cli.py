@@ -10,6 +10,7 @@ from gtdb_downloader.config import get_base_dir, GTDB_VERSIONS
 from gtdb_downloader.downloader import (
     check_aria2c_available,
     download_file,
+    download_files_aria2,
     download_metadata,
     generate_download_link,
     resolve_download_link,
@@ -90,6 +91,11 @@ def build_mapping_file(
     mappings = _collect_existing_genome_mappings(genomes_dir)
     _write_mapping_file(resolved_mapping_path, mappings)
     return resolved_mapping_path
+
+
+def _chunked(items: List[Dict[str, object]], chunk_size: int) -> List[List[Dict[str, object]]]:
+    """Split a list into fixed-size chunks."""
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
 def setup_version_dir(version: str, base_dir: Path) -> Path:
@@ -249,49 +255,103 @@ def download_genomes_for_taxon(
     ]
 
     if pending_downloads:
-        downloader_name = "aria2c" if check_aria2c_available() else "wget"
+        use_aria2 = check_aria2c_available()
+        downloader_name = "aria2c" if use_aria2 else "wget"
         print(
-            f"\nStarting download of {len(pending_downloads)} genomes with immediate fallback retries using {downloader_name}..."
+            f"\nStarting download of {len(pending_downloads)} genomes with chunked fallback retries using {downloader_name}..."
         )
+        chunk_size = 250 if use_aria2 else 25
+        total_chunks = (len(pending_downloads) + chunk_size - 1) // chunk_size
 
-    for item in pending_downloads:
-        genome_id = item["genome_id"]
-        download_url = item["download_url"]
-        genome_path = item["genome_path"]
+        for chunk_index, chunk in enumerate(_chunked(pending_downloads, chunk_size), start=1):
+            print(
+                f"\nPrimary download chunk {chunk_index}/{total_chunks} "
+                f"({len(chunk)} genomes)..."
+            )
 
-        if verbose:
-            print(f"  Downloading {genome_id}...")
+            primary_downloads: List[Tuple[str, Path]] = [
+                (item["download_url"], item["genome_path"])  # type: ignore[arg-type]
+                for item in chunk
+                if not item["genome_path"].exists()  # type: ignore[union-attr]
+            ]
 
-        success = download_file(download_url, genome_path, verbose=verbose)
-        batch_results[genome_path] = success
+            if use_aria2:
+                tmp_dir = genomes_dir / ".tmp"
+                chunk_results = download_files_aria2(
+                    primary_downloads,
+                    verbose=verbose,
+                    tmp_dir=tmp_dir,
+                )
+            else:
+                chunk_results = {}
+                for url, genome_path in primary_downloads:
+                    chunk_results[genome_path] = download_file(
+                        url,
+                        genome_path,
+                        verbose=verbose,
+                        use_aria2=False,
+                    )
 
-        if success or genome_path.exists():
-            continue
+            batch_results.update(chunk_results)
 
-        if verbose:
-            print(f"  Primary download failed for {genome_id}; resolving fallback...")
+            failed_chunk_items = [
+                item
+                for item in chunk
+                if not item["genome_path"].exists() and not batch_results.get(item["genome_path"], False)  # type: ignore[union-attr]
+            ]
 
-        genome_metadata = item["genome_metadata"]
-        try:
-            fallback_url = resolve_download_link(genome_metadata, verbose=verbose)  # type: ignore[arg-type]
-            fallback_filename = fallback_url.split("/")[-1]
-            fallback_path = genomes_dir / fallback_filename
-            item["download_url"] = fallback_url
-            item["genome_path"] = fallback_path
-        except Exception as e:
-            if verbose:
-                print(f"  Fallback resolution failed for {genome_id}: {e}")
-            continue
+            if not failed_chunk_items:
+                continue
 
-        if fallback_path.exists():
-            batch_results[fallback_path] = True
-            continue
+            print(
+                f"Resolving fallbacks for {len(failed_chunk_items)} failed genomes in chunk {chunk_index}/{total_chunks}..."
+            )
 
-        batch_results[fallback_path] = download_file(
-            fallback_url,
-            fallback_path,
-            verbose=verbose,
-        )
+            fallback_downloads: List[Tuple[str, Path]] = []
+            for item in failed_chunk_items:
+                genome_id = item["genome_id"]
+                genome_metadata = item["genome_metadata"]
+                if verbose:
+                    print(f"  Resolving fallback for {genome_id}...")
+
+                try:
+                    fallback_url = resolve_download_link(genome_metadata, verbose=verbose)  # type: ignore[arg-type]
+                    fallback_filename = fallback_url.split("/")[-1]
+                    fallback_path = genomes_dir / fallback_filename
+                    item["download_url"] = fallback_url
+                    item["genome_path"] = fallback_path
+                except Exception as e:
+                    if verbose:
+                        print(f"  Fallback resolution failed for {genome_id}: {e}")
+                    continue
+
+                if fallback_path.exists():
+                    batch_results[fallback_path] = True
+                    continue
+
+                fallback_downloads.append((fallback_url, fallback_path))
+
+            if not fallback_downloads:
+                continue
+
+            if use_aria2:
+                tmp_dir = genomes_dir / ".tmp"
+                fallback_results = download_files_aria2(
+                    fallback_downloads,
+                    verbose=verbose,
+                    tmp_dir=tmp_dir,
+                )
+            else:
+                fallback_results = {}
+                for url, genome_path in fallback_downloads:
+                    fallback_results[genome_path] = download_file(
+                        url,
+                        genome_path,
+                        verbose=verbose,
+                        use_aria2=False,
+                    )
+
+            batch_results.update(fallback_results)
 
     downloaded_count = 0
     for item in downloadable:
