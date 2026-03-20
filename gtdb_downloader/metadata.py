@@ -64,6 +64,17 @@ class MetadataParser:
         if not query:
             return matching_genomes
 
+        # Support comma-separated OR queries, e.g. "Bacteria,Archaea".
+        comma_queries = [part.strip() for part in query.split(",") if part.strip()]
+        if len(comma_queries) > 1:
+            seen = set()
+            for subquery in comma_queries:
+                for genome_id in self.get_genomes_by_taxon(subquery, field=field):
+                    if genome_id not in seen:
+                        seen.add(genome_id)
+                        matching_genomes.append(genome_id)
+            return matching_genomes
+
         query_components = [part.strip() for part in query.split(";") if part.strip()]
         query_components_lower = [part.lower() for part in query_components]
 

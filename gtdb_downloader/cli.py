@@ -157,6 +157,7 @@ def download_genomes_for_taxon(
     output_dir: Optional[Path] = None,
     flat: Optional[str] = None,
     flag_rep: bool = False,
+    only_rep: bool = False,
     ignore_prefix: bool = False,
     verbose: bool = False,
     dry_run: bool = False
@@ -212,6 +213,19 @@ def download_genomes_for_taxon(
     if not matching_genomes:
         print(f"No genomes found for taxon: {taxon}", file=sys.stderr)
         return False
+
+    if only_rep:
+        matching_genomes = [
+            genome_id
+            for genome_id in matching_genomes
+            if parser.is_species_cluster_representative(genome_id)
+        ]
+        if not matching_genomes:
+            print(
+                f"No species representative genomes found for taxon: {taxon}",
+                file=sys.stderr,
+            )
+            return False
     
     print(f"Found {len(matching_genomes)} genomes for taxon: {taxon}")
     
@@ -502,7 +516,10 @@ Examples:
     
     parser.add_argument(
         "--taxon",
-        help="Taxon to search for (e.g., 'Bacillota' or full GTDB taxonomy path)"
+        help=(
+            "Taxon to search for (e.g., 'Bacillota', 'Bacteria,Archaea', "
+            "or full GTDB taxonomy path)"
+        )
     )
     
     parser.add_argument(
@@ -528,6 +545,12 @@ Examples:
         "--flag-rep",
         action="store_true",
         help="Append .speciesrep.fna.gz to symlinks for species-cluster representatives"
+    )
+
+    parser.add_argument(
+        "--only-rep",
+        action="store_true",
+        help="Only include genomes marked as species representatives in metadata (gtdb_representative=t)"
     )
 
     parser.add_argument(
@@ -628,6 +651,7 @@ Examples:
             output_dir=args.output,
             flat=args.flat,
             flag_rep=args.flag_rep,
+            only_rep=args.only_rep,
             ignore_prefix=args.ignore_prefix,
             verbose=args.verbose,
             dry_run=args.dry_run

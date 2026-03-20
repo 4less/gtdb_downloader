@@ -96,6 +96,9 @@ gtdb-dl --gtdb r226 --taxon "Bacillota" --output /path/to/my_project/genomes
 # Tag species representatives in symlink names
 gtdb-dl --gtdb r226 --taxon "Bacillota" --flag-rep
 
+# Download/symlink only species representative genomes
+gtdb-dl --gtdb r226 --taxon "Bacteria,Archaea" --only-rep --output genomes
+
 # Treat GCA/GCF prefixes as interchangeable during presence checks and fallback resolution
 gtdb-dl --gtdb r226 --dataset ar53 --taxon "Archaea" --ignore-prefix
 
@@ -179,19 +182,20 @@ The accession mapping file is rebuilt from the actual contents of `genomes/raw/`
 usage: gtdb-dl [-h] --gtdb {r207,r214,r220,r226} [--taxon TAXON]
                [--dataset {bac120,ar53}] [--mirror {europe,asia-pacific1,asia-pacific2}]
                [--flat {domain,phylum,class,order,family,genus,species,d,p,c,o,f,g,s}]
-               [--flag-rep] [--ignore-prefix] [--output OUTPUT] [--mapping-file [MAPPING_FILE]]
+               [--flag-rep] [--only-rep] [--ignore-prefix] [--output OUTPUT] [--mapping-file [MAPPING_FILE]]
                [--download] [--verbose] [--dry-run]
                [--base-dir BASE_DIR]
 
 optional arguments:
   -h, --help                              show this help message and exit
   --gtdb {r207,r214,r220,r226}            GTDB version to use (required)
-  --taxon TAXON                           Taxon to search for
+  --taxon TAXON                           Taxon to search for (supports comma-separated OR queries)
   --dataset {bac120,ar53}                 Dataset type (default: bac120)
   --mirror {europe,asia-pacific1,asia-pacific2}  Mirror to download from (default: europe)
   --flat {domain,phylum,class,order,family,genus,species,d,p,c,o,f,g,s}
                                           Create a flat symlink structure at given rank
   --flag-rep                              Append .speciesrep.fna.gz to symlinks for species-cluster representatives
+  --only-rep                              Only include genomes marked as species representatives (gtdb_representative=t)
   --ignore-prefix                         Treat GCA_ and GCF_ prefixes as interchangeable
   --output OUTPUT, -o OUTPUT              Output directory for symlink taxonomy structure
   --mapping-file [MAPPING_FILE]           Write or refresh accession-to-path TSV from existing raw genomes
