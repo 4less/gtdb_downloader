@@ -3,6 +3,7 @@
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
@@ -105,6 +106,35 @@ def build_mapping_file(
 def _chunked(items: List[Dict[str, object]], chunk_size: int) -> List[List[Dict[str, object]]]:
     """Split a list into fixed-size chunks."""
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def _render_progress(
+    current: int,
+    total: int,
+    *,
+    prefix: str,
+    width: int = 28,
+    done: bool = False,
+) -> None:
+    """Render progress to stdout (TTY bar, line-based fallback for logs)."""
+    if total <= 0:
+        return
+
+    pct = int((current / total) * 100)
+    if sys.stdout.isatty():
+        filled = min(width, int((current / total) * width))
+        bar = "#" * filled + "-" * (width - filled)
+        end = "\n" if done else "\r"
+        print(
+            f"{prefix} [{bar}] {pct:3d}% ({current}/{total})",
+            end=end,
+            flush=True,
+        )
+        return
+
+    # In non-interactive logs (e.g., batch jobs), emit a line every 5%.
+    if done or current == total or current == 1 or current % max(1, total // 20) == 0:
+        print(f"{prefix} {pct:3d}% ({current}/{total})", flush=True)
 
 
 def _get_accession_keys(accession: str, ignore_prefix: bool) -> List[str]:
@@ -248,10 +278,22 @@ def download_genomes_for_taxon(
     representative_by_cluster: Dict[str, List[str]] = {}
     failed_count = 0
     existing_genomes = _index_existing_genomes(genomes_dir, ignore_prefix)
+    total_genomes = len(matching_genomes)
+    show_prep_progress = not verbose and total_genomes > 200
+    last_progress_update = 0.0
+
+    if show_prep_progress:
+        print(f"\nPreparing {total_genomes} genome entries before download...")
+        _render_progress(0, total_genomes, prefix="Preparing", done=False)
 
     for i, genome_id in enumerate(matching_genomes, 1):
         if verbose:
             print(f"\n[{i}/{len(matching_genomes)}] Processing {genome_id}...")
+        elif show_prep_progress:
+            now = time.monotonic()
+            if i == total_genomes or now - last_progress_update >= 0.2:
+                _render_progress(i, total_genomes, prefix="Preparing", done=(i == total_genomes))
+                last_progress_update = now
 
         genome_metadata = parser.get_genome_metadata(genome_id)
         if genome_metadata is None:
