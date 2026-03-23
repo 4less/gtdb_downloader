@@ -96,6 +96,16 @@ def _resolve_mapping_path(base_dir: Path, version: str, mapping_file: Optional[P
     return default_path.parent / mapping_file
 
 
+def _resolve_failed_path(base_dir: Path, version: str, failed_file: Optional[Path]) -> Optional[Path]:
+    """Resolve failed-genome output path, using version directory for relative paths."""
+    if failed_file is None:
+        return None
+    default_dir = base_dir / version
+    if failed_file.is_absolute():
+        return failed_file
+    return default_dir / failed_file
+
+
 def _collect_existing_genome_mappings(genomes_dir: Path) -> Dict[str, Path]:
     """Scan the raw genome directory and build accession-to-path mappings."""
     mappings: Dict[str, Path] = {}
@@ -233,6 +243,7 @@ def download_genomes_for_taxon(
     flag_rep: bool = False,
     only_rep: bool = False,
     ignore_prefix: bool = False,
+    failed_file: Optional[Path] = None,
     verbose: bool = False,
     dry_run: bool = False
 ) -> bool:
@@ -329,6 +340,8 @@ def download_genomes_for_taxon(
     downloadable: List[Dict[str, object]] = []
     representative_by_cluster: Dict[str, List[str]] = {}
     failed_count = 0
+    failed_genomes: List[str] = []
+    failed_attempted_urls: Dict[str, List[str]] = {}
     existing_genomes = _index_existing_genomes(genomes_dir, ignore_prefix)
     total_genomes = len(matching_genomes)
     show_prep_progress = not verbose and total_genomes > 200
@@ -352,6 +365,8 @@ def download_genomes_for_taxon(
             if verbose:
                 print("  Skipped: Could not find genome metadata")
             failed_count += 1
+            failed_genomes.append(genome_id)
+            failed_attempted_urls.setdefault(genome_id, [])
             continue
 
         tax_info = parser.get_taxon_path(genome_id)
@@ -359,6 +374,8 @@ def download_genomes_for_taxon(
             if verbose:
                 print("  Skipped: Could not find taxonomy info")
             failed_count += 1
+            failed_genomes.append(genome_id)
+            failed_attempted_urls.setdefault(genome_id, [])
             continue
 
         taxonomy_str, _ = tax_info
@@ -371,6 +388,8 @@ def download_genomes_for_taxon(
             if verbose:
                 print(f"  Skipped: Could not generate download link: {e}")
             failed_count += 1
+            failed_genomes.append(genome_id)
+            failed_attempted_urls.setdefault(genome_id, [])
             continue
 
         genome_path = genomes_dir / genome_filename
@@ -394,6 +413,7 @@ def download_genomes_for_taxon(
             "cluster_rep": cluster_rep,
             "genome_metadata": genome_metadata,
             "download_urls": download_urls,
+            "attempted_urls": [],
         })
 
         if flag_rep and is_species_rep:
@@ -433,14 +453,13 @@ def download_genomes_for_taxon(
                 f"({len(chunk)} genomes)..."
             )
 
-            primary_downloads: List[Tuple[str, Path]] = [
-                (
-                    item["download_urls"][0],  # type: ignore[index]
-                    item["genome_path"],
-                )
-                for item in chunk
-                if not item["local_present"]  # type: ignore[index]
-            ]
+            primary_downloads: List[Tuple[str, Path]] = []
+            for item in chunk:
+                if item["local_present"]:  # type: ignore[index]
+                    continue
+                url = item["download_urls"][0]  # type: ignore[index]
+                item["attempted_urls"].append(url)  # type: ignore[index]
+                primary_downloads.append((url, item["genome_path"]))  # type: ignore[index]
 
             if use_aria2:
                 tmp_dir = genomes_dir / ".tmp"
@@ -507,6 +526,7 @@ def download_genomes_for_taxon(
                     item["local_present"] = True
                     continue
 
+                item["attempted_urls"].append(fallback_url)  # type: ignore[index]
                 fallback_downloads.append((fallback_url, fallback_path))
 
             if not fallback_downloads:
@@ -543,6 +563,8 @@ def download_genomes_for_taxon(
             if verbose:
                 print(f"  Failed to download {genome_id}")
             failed_count += 1
+            failed_genomes.append(genome_id)
+            failed_attempted_urls[genome_id] = list(item.get("attempted_urls", []))  # type: ignore[arg-type]
             continue
 
         # Create symlink in taxonomy structure
@@ -579,6 +601,18 @@ def download_genomes_for_taxon(
 
     mapping_path = build_mapping_file(version, base_dir=base_dir, show_progress=verbose)
     print(f"Mapping file written to: {mapping_path}")
+
+    resolved_failed_path = _resolve_failed_path(base_dir, version, failed_file)
+    if resolved_failed_path is not None:
+        resolved_failed_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(resolved_failed_path, "w", encoding="utf-8") as handle:
+            for genome_id in sorted(set(failed_genomes)):
+                attempted_urls = failed_attempted_urls.get(genome_id, [])
+                if attempted_urls:
+                    handle.write("\t".join([genome_id, *attempted_urls]) + "\n")
+                else:
+                    handle.write(f"{genome_id}\n")
+        print(f"Failed genome list written to: {resolved_failed_path}")
     
     print(f"\n✓ Downloaded: {downloaded_count}")
     print(f"✗ Failed: {failed_count}")
@@ -678,6 +712,17 @@ Examples:
             "Can be used without --taxon to build the mapping from existing downloaded genomes."
         )
     )
+
+    parser.add_argument(
+        "--failed-file",
+        nargs="?",
+        const=Path("failed_genomes.txt"),
+        type=Path,
+        help=(
+            "Write failed-genome TSV: column 1 genome ID, columns 2+ attempted URLs. "
+            "Relative paths are written under ~/.gtdb_downloader/{version}/."
+        )
+    )
     
     parser.add_argument(
         "--download",
@@ -755,6 +800,7 @@ Examples:
             flag_rep=args.flag_rep,
             only_rep=args.only_rep,
             ignore_prefix=args.ignore_prefix,
+            failed_file=args.failed_file,
             verbose=args.verbose,
             dry_run=args.dry_run
         )
