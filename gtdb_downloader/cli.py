@@ -174,7 +174,8 @@ def _fetch_ncbi_status_batch(
     started = time.monotonic()
     print(
         f"Checking NCBI status for {len(unique_accessions)} accessions "
-        f"(workers={workers}, timeout={timeout_seconds}s)..."
+        f"(workers={workers}, timeout={timeout_seconds}s)...",
+        flush=True,
     )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -192,10 +193,10 @@ def _fetch_ncbi_status_batch(
             results[accession] = status_text
             done += 1
             if done == len(unique_accessions) or done % 25 == 0:
-                print(f"  NCBI status progress: {done}/{len(unique_accessions)}")
+                print(f"  NCBI status progress: {done}/{len(unique_accessions)}", flush=True)
 
     elapsed = time.monotonic() - started
-    print(f"NCBI status checks completed in {elapsed:.1f}s")
+    print(f"NCBI status checks completed in {elapsed:.1f}s", flush=True)
     return results
 
 
@@ -589,7 +590,7 @@ def download_genomes_for_taxon(
 
             print(
                 f"Resolving fallbacks for {len(failed_chunk_items)} failed genomes in chunk {chunk_index}/{total_chunks}..."
-            )
+            , flush=True)
 
             # Run NCBI status checks in parallel before fallback resolution.
             accessions_to_query: List[str] = []
@@ -609,7 +610,7 @@ def download_genomes_for_taxon(
                 if verbose:
                     print(f"  Resolving fallback for {genome_id}...")
                 elif idx == len(failed_chunk_items) or idx % 50 == 0:
-                    print(f"  Fallback decision progress: {idx}/{len(failed_chunk_items)}")
+                    print(f"  Fallback decision progress: {idx}/{len(failed_chunk_items)}", flush=True)
 
                 accession = _extract_ncbi_accession(genome_id, genome_metadata)  # type: ignore[arg-type]
                 if accession:
