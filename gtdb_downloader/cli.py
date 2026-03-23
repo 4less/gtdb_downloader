@@ -2,6 +2,7 @@
 
 import argparse
 import concurrent.futures
+import json
 import re
 import sys
 import time
@@ -137,23 +138,69 @@ def _fetch_ncbi_datasets_status(accession: str, timeout_seconds: int = 12) -> Tu
         Tuple of (datasets_url, extracted_status_text_or_none)
     """
     datasets_url = f"https://www.ncbi.nlm.nih.gov/datasets/genome/{accession}/"
-    try:
-        response = requests.get(datasets_url, timeout=timeout_seconds)
-        response.raise_for_status()
-    except Exception:
-        return datasets_url, None
+    query_urls = [
+        datasets_url,
+        f"{datasets_url}?report=assembly",
+        f"https://api.ncbi.nlm.nih.gov/datasets/v2/genome/accession/{accession}/dataset_report",
+    ]
+    headers = {
+        "User-Agent": "gtdb-downloader/0.1 (+https://github.com/)"
+    }
 
-    # Strip tags for a resilient plain-text search.
-    plain_text = re.sub(r"<[^>]+>", " ", response.text)
-    plain_text = re.sub(r"\s+", " ", plain_text)
-    match = re.search(r"Status:\s*(.{1,220}?)\s{1,}(?:This record|Actions|Download|datasets|API|FTP|$)", plain_text, re.IGNORECASE)
-    if match:
-        return datasets_url, match.group(1).strip()
+    def _extract_status_from_text(text: str) -> Optional[str]:
+        compact = re.sub(r"\s+", " ", text)
+        status_line = re.search(
+            r"Status:\s*(.{1,260}?)\s{1,}(?:This record|Actions|Download|datasets|API|FTP|$)",
+            compact,
+            re.IGNORECASE,
+        )
+        if status_line:
+            return status_line.group(1).strip()
 
-    idx = plain_text.lower().find("status:")
-    if idx >= 0:
-        snippet = plain_text[idx:idx + 240].strip()
-        return datasets_url, snippet
+        # Some pages expose "RefSeq <accession> is suppressed" without a clean Status block.
+        suppressed_phrase = re.search(
+            rf"((?:RefSeq|GenBank)?\s*{re.escape(accession)}\s+is\s+suppressed)",
+            compact,
+            re.IGNORECASE,
+        )
+        if suppressed_phrase:
+            return f"Status: {suppressed_phrase.group(1)}"
+
+        if accession.lower() in compact.lower() and "suppressed" in compact.lower():
+            return f"Status: {accession} appears suppressed"
+        return None
+
+    for url in query_urls:
+        try:
+            response = requests.get(url, timeout=timeout_seconds, headers=headers)
+        except Exception:
+            continue
+
+        body = response.text or ""
+        direct_status = _extract_status_from_text(body)
+        if direct_status:
+            return datasets_url, direct_status
+
+        # Strip tags and re-check plain text for server-side rendered fragments.
+        plain_text = re.sub(r"<[^>]+>", " ", body)
+        plain_text = re.sub(r"\s+", " ", plain_text)
+        plain_status = _extract_status_from_text(plain_text)
+        if plain_status:
+            return datasets_url, plain_status
+
+        # Parse JSON payloads when present.
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+        if payload is not None:
+            payload_text = json.dumps(payload, ensure_ascii=False)
+            json_status = _extract_status_from_text(payload_text)
+            if json_status:
+                return datasets_url, json_status
+
+            if "suppressed" in payload_text.lower() and accession.lower() in payload_text.lower():
+                return datasets_url, f"Status: {accession} appears suppressed"
 
     return datasets_url, None
 
