@@ -393,8 +393,11 @@ def download_genomes_for_taxon(
     failed_count = 0
     failed_genomes: List[str] = []
     failed_attempted_urls: Dict[str, List[str]] = {}
+    failed_status_notes: Dict[str, str] = {}
     suppressed_genomes: List[str] = []
     status_cache: Dict[str, Optional[str]] = {}
+    ncbi_checked_genomes = 0
+    ncbi_missing_status_genomes = 0
     existing_genomes = _index_existing_genomes(genomes_dir, ignore_prefix)
     total_genomes = len(matching_genomes)
     show_prep_progress = not verbose and total_genomes > 200
@@ -555,10 +558,16 @@ def download_genomes_for_taxon(
 
                 accession = _extract_ncbi_accession(genome_id, genome_metadata)  # type: ignore[arg-type]
                 if accession:
+                    ncbi_checked_genomes += 1
                     if accession not in status_cache:
                         _, status_text = _fetch_ncbi_datasets_status(accession)
                         status_cache[accession] = status_text
                     status_text = status_cache.get(accession)
+                    if status_text:
+                        failed_status_notes[genome_id] = f"status:{status_text}"
+                    else:
+                        failed_status_notes[genome_id] = "status:unavailable_or_not_found"
+                        ncbi_missing_status_genomes += 1
                     if status_text and "suppressed" in status_text.lower():
                         datasets_url = f"https://www.ncbi.nlm.nih.gov/datasets/genome/{accession}/"
                         suppressed_msg = (
@@ -568,6 +577,8 @@ def download_genomes_for_taxon(
                         print(suppressed_msg, file=sys.stderr)
                         suppressed_genomes.append(genome_id)  # type: ignore[arg-type]
                         continue
+                else:
+                    failed_status_notes[genome_id] = "status:no_accession"
 
                 try:
                     fallback_url = resolve_download_link(
@@ -682,9 +693,20 @@ def download_genomes_for_taxon(
                 else:
                     handle.write(f"{genome_id}\n")
         print(f"Failed genome list written to: {resolved_failed_path}")
+        status_path = resolved_failed_path.with_name(resolved_failed_path.stem + ".status.tsv")
+        with open(status_path, "w", encoding="utf-8") as handle:
+            for genome_id in sorted(set(failed_genomes)):
+                note = failed_status_notes.get(genome_id, "status:not_checked")
+                handle.write(f"{genome_id}\t{note}\n")
+        print(f"Failed status list written to: {status_path}")
     
     print(f"\n✓ Downloaded: {downloaded_count}")
     print(f"✗ Failed: {failed_count}")
+    if failed_count:
+        print(
+            f"NCBI status checks: {ncbi_checked_genomes} "
+            f"(no status line or unreachable: {ncbi_missing_status_genomes})"
+        )
     if suppressed_genomes:
         print(f"Suppressed at NCBI Datasets: {len(set(suppressed_genomes))}")
     print(f"Genomes stored in: {genomes_dir}")
