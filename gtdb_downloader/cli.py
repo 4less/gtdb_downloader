@@ -1,6 +1,7 @@
 """Command-line interface for GTDB downloader"""
 
 import argparse
+import concurrent.futures
 import re
 import sys
 import time
@@ -155,6 +156,47 @@ def _fetch_ncbi_datasets_status(accession: str, timeout_seconds: int = 12) -> Tu
         return datasets_url, snippet
 
     return datasets_url, None
+
+
+def _fetch_ncbi_status_batch(
+    accessions: List[str],
+    *,
+    timeout_seconds: int = 4,
+    max_workers: int = 24,
+) -> Dict[str, Optional[str]]:
+    """Fetch NCBI Datasets status lines for many accessions in parallel."""
+    if not accessions:
+        return {}
+
+    unique_accessions = sorted(set(accessions))
+    workers = max(1, min(max_workers, len(unique_accessions)))
+    results: Dict[str, Optional[str]] = {}
+    started = time.monotonic()
+    print(
+        f"Checking NCBI status for {len(unique_accessions)} accessions "
+        f"(workers={workers}, timeout={timeout_seconds}s)..."
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_accession = {
+            executor.submit(_fetch_ncbi_datasets_status, accession, timeout_seconds): accession
+            for accession in unique_accessions
+        }
+        done = 0
+        for future in concurrent.futures.as_completed(future_to_accession):
+            accession = future_to_accession[future]
+            try:
+                _, status_text = future.result()
+            except Exception:
+                status_text = None
+            results[accession] = status_text
+            done += 1
+            if done == len(unique_accessions) or done % 25 == 0:
+                print(f"  NCBI status progress: {done}/{len(unique_accessions)}")
+
+    elapsed = time.monotonic() - started
+    print(f"NCBI status checks completed in {elapsed:.1f}s")
+    return results
 
 
 def _collect_existing_genome_mappings(genomes_dir: Path) -> Dict[str, Path]:
@@ -549,19 +591,29 @@ def download_genomes_for_taxon(
                 f"Resolving fallbacks for {len(failed_chunk_items)} failed genomes in chunk {chunk_index}/{total_chunks}..."
             )
 
-            fallback_downloads: List[Tuple[str, Path]] = []
+            # Run NCBI status checks in parallel before fallback resolution.
+            accessions_to_query: List[str] = []
             for item in failed_chunk_items:
+                accession = _extract_ncbi_accession(  # type: ignore[arg-type]
+                    item["genome_id"], item["genome_metadata"]
+                )
+                if accession and accession not in status_cache:
+                    accessions_to_query.append(accession)
+            if accessions_to_query:
+                status_cache.update(_fetch_ncbi_status_batch(accessions_to_query))
+
+            fallback_downloads: List[Tuple[str, Path]] = []
+            for idx, item in enumerate(failed_chunk_items, start=1):
                 genome_id = item["genome_id"]
                 genome_metadata = item["genome_metadata"]
                 if verbose:
                     print(f"  Resolving fallback for {genome_id}...")
+                elif idx == len(failed_chunk_items) or idx % 50 == 0:
+                    print(f"  Fallback decision progress: {idx}/{len(failed_chunk_items)}")
 
                 accession = _extract_ncbi_accession(genome_id, genome_metadata)  # type: ignore[arg-type]
                 if accession:
                     ncbi_checked_genomes += 1
-                    if accession not in status_cache:
-                        _, status_text = _fetch_ncbi_datasets_status(accession)
-                        status_cache[accession] = status_text
                     status_text = status_cache.get(accession)
                     if status_text:
                         failed_status_notes[genome_id] = f"status:{status_text}"
