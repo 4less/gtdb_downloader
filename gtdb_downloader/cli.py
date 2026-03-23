@@ -91,13 +91,13 @@ def _populate_shared_raw_from_legacy(base_dir: Path, shared_raw_dir: Path, verbo
 
 
 def _resolve_mapping_path(base_dir: Path, version: str, mapping_file: Optional[Path]) -> Path:
-    """Resolve mapping file path, using the default location when omitted or relative."""
+    """Resolve mapping file path, using CWD for relative custom paths."""
     default_path = _get_default_mapping_path(base_dir, version)
     if mapping_file is None:
         return default_path
     if mapping_file.is_absolute():
         return mapping_file
-    return default_path.parent / mapping_file
+    return Path.cwd() / mapping_file
 
 
 def _resolve_failed_path(base_dir: Path, version: str, failed_file: Optional[Path]) -> Optional[Path]:
@@ -264,10 +264,103 @@ def _collect_existing_genome_mappings(genomes_dir: Path) -> Dict[str, Path]:
     return mappings
 
 
+def _normalize_mapping_accession(accession: str) -> Optional[str]:
+    """Normalize metadata accession to mapping accession key."""
+    if accession.startswith(("RS_", "GB_")):
+        accession = accession[3:]
+    if accession.startswith(("GCA_", "GCF_")):
+        return accession
+    return None
+
+
+def _collect_target_accessions_for_mapping(
+    *,
+    version: str,
+    datasets: List[str],
+    taxon: Optional[str],
+    only_rep: bool,
+    base_dir: Path,
+    mirror: str,
+    verbose: bool,
+) -> Optional[set]:
+    """
+    Collect normalized accession keys for custom mapping subsets.
+
+    Returns None when no filtering is needed (full map).
+    """
+    if taxon is None and not only_rep:
+        return None
+
+    target_accessions: set = set()
+    version_dir = setup_version_dir(version, base_dir)
+
+    for dataset in datasets:
+        metadata_file = download_metadata(version, dataset, version_dir, mirror=mirror, verbose=verbose)
+        if metadata_file is None:
+            continue
+        parser = MetadataParser(metadata_file)
+        genome_ids = parser.get_genomes_by_taxon(taxon) if taxon else list(parser.data.keys())
+        if only_rep:
+            genome_ids = [gid for gid in genome_ids if parser.is_species_cluster_representative(gid)]
+        for genome_id in genome_ids:
+            genome_metadata = parser.get_genome_metadata(genome_id)
+            if not genome_metadata:
+                continue
+            accession = genome_metadata.get("accession")
+            if not isinstance(accession, str):
+                continue
+            normalized = _normalize_mapping_accession(accession)
+            if normalized:
+                target_accessions.add(normalized)
+
+    return target_accessions
+
+
+def _collect_taxonomy_lookup_for_mapping(
+    *,
+    version: str,
+    datasets: List[str],
+    base_dir: Path,
+    mirror: str,
+    verbose: bool,
+    ensure_metadata: bool = False,
+) -> Dict[str, str]:
+    """Build accession -> taxonomy mapping from GTDB metadata."""
+    lookup: Dict[str, str] = {}
+    version_dir = setup_version_dir(version, base_dir)
+
+    for dataset in datasets:
+        metadata_pattern = f"{dataset}_metadata_{version}.tsv.gz"
+        metadata_file = version_dir / metadata_pattern
+        if not metadata_file.exists():
+            if not ensure_metadata:
+                continue
+            downloaded = download_metadata(version, dataset, version_dir, mirror=mirror, verbose=verbose)
+            if downloaded is None:
+                continue
+            metadata_file = downloaded
+
+        parser = MetadataParser(metadata_file)
+        for genome_metadata in parser.data.values():
+            accession = genome_metadata.get("accession")
+            taxonomy = genome_metadata.get("gtdb_taxonomy")
+            if not isinstance(accession, str) or not isinstance(taxonomy, str):
+                continue
+            normalized = _normalize_mapping_accession(accession)
+            if not normalized:
+                continue
+            # Keep first seen taxonomy for a stable map.
+            lookup.setdefault(normalized, taxonomy)
+
+    return lookup
+
+
 def build_mapping_file(
     version: str,
     base_dir: Optional[Path] = None,
     mapping_file: Optional[Path] = None,
+    include_accessions: Optional[set] = None,
+    taxonomy_lookup: Optional[Dict[str, str]] = None,
     show_progress: bool = False,
 ) -> Path:
     """Create or refresh the accession-to-path mapping file from existing genomes."""
@@ -279,6 +372,8 @@ def build_mapping_file(
     _populate_shared_raw_from_legacy(base_dir, genomes_dir, verbose=show_progress)
     resolved_mapping_path = _resolve_mapping_path(base_dir, version, mapping_file)
     mappings = _collect_existing_genome_mappings(genomes_dir)
+    if include_accessions is not None:
+        mappings = {acc: p for acc, p in mappings.items() if acc in include_accessions}
     resolved_mapping_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = resolved_mapping_path.with_suffix(resolved_mapping_path.suffix + ".tmp")
 
@@ -287,7 +382,10 @@ def build_mapping_file(
 
     with open(tmp_path, "w", encoding="utf-8") as handle:
         for count, (accession, genome_path) in enumerate(sorted(mappings.items()), start=1):
-            handle.write(f"{accession}\t{genome_path}\n")
+            taxonomy = ""
+            if taxonomy_lookup is not None:
+                taxonomy = taxonomy_lookup.get(accession, "")
+            handle.write(f"{accession}\t{genome_path}\t{taxonomy}\n")
             if show_progress and count % 1000 == 0:
                 print(f"  Mapped {count} genomes...")
 
@@ -731,8 +829,21 @@ def download_genomes_for_taxon(
 
             batch_results.update(fallback_results)
 
+    print("\nFinalizing symlinks/results...", flush=True)
     downloaded_count = 0
-    for item in downloadable:
+    show_finalize_progress = not verbose and len(downloadable) > 200
+    finalize_total = len(downloadable)
+    finalize_last_update = 0.0
+    if show_finalize_progress:
+        _render_progress(0, finalize_total, prefix="Finalizing", done=False)
+
+    for idx, item in enumerate(downloadable, start=1):
+        if show_finalize_progress:
+            now = time.monotonic()
+            if idx == finalize_total or now - finalize_last_update >= 0.2:
+                _render_progress(idx, finalize_total, prefix="Finalizing", done=(idx == finalize_total))
+                finalize_last_update = now
+
         genome_id = item["genome_id"]
         taxonomy_str = item["taxonomy_str"]
         genome_path = item["genome_path"]
@@ -779,7 +890,20 @@ def download_genomes_for_taxon(
         
         downloaded_count += 1
 
-    mapping_path = build_mapping_file(version, base_dir=base_dir, show_progress=verbose)
+    taxonomy_lookup = _collect_taxonomy_lookup_for_mapping(
+        version=version,
+        datasets=["bac120", "ar53"],
+        base_dir=base_dir,
+        mirror=mirror,
+        verbose=verbose,
+        ensure_metadata=False,
+    )
+    mapping_path = build_mapping_file(
+        version,
+        base_dir=base_dir,
+        taxonomy_lookup=taxonomy_lookup,
+        show_progress=verbose,
+    )
     print(f"Mapping file written to: {mapping_path}")
 
     resolved_failed_path = _resolve_failed_path(base_dir, version, failed_file)
@@ -853,9 +977,9 @@ Examples:
     
     parser.add_argument(
         "--dataset",
-        choices=["bac120", "ar53"],
-        default="bac120",
-        help="Dataset type (default: bac120)"
+        choices=["bac120", "ar53", "all"],
+        default="all",
+        help="Dataset type (default: all)"
     )
     
     parser.add_argument(
@@ -901,8 +1025,9 @@ Examples:
         const=Path("accession_path_map.tsv"),
         type=Path,
         help=(
-            "Write or refresh a TSV mapping file of accession to local raw genome path. "
-            "Can be used without --taxon to build the mapping from existing downloaded genomes."
+            "Write or refresh a TSV mapping file (col1 accession, col2 local raw genome path, col3 taxonomy). "
+            "With no file value, print the global mapping file path for the selected version. "
+            "Relative custom paths are resolved from the current working directory."
         )
     )
 
@@ -943,69 +1068,131 @@ Examples:
     )
     
     args = parser.parse_args()
-    
+    argv = sys.argv[1:]
+    mapping_flag_without_value = False
+    for i, token in enumerate(argv):
+        if token == "--mapping-file":
+            if i == len(argv) - 1 or argv[i + 1].startswith("-"):
+                mapping_flag_without_value = True
+            break
+
     base_dir = args.base_dir or get_base_dir()
     
     if args.verbose:
         print(f"Using base directory: {base_dir}")
 
     if args.mapping_file is not None and not args.taxon and not args.download:
+        if mapping_flag_without_value:
+            print(f"Global mapping file: {_get_default_mapping_path(base_dir, args.gtdb)}")
+            return 0
+
+        datasets = ["bac120", "ar53"] if args.dataset == "all" else [args.dataset]
+        include_accessions = _collect_target_accessions_for_mapping(
+            version=args.gtdb,
+            datasets=datasets,
+            taxon=None,
+            only_rep=args.only_rep,
+            base_dir=base_dir,
+            mirror=args.mirror,
+            verbose=args.verbose,
+        )
+        taxonomy_lookup = _collect_taxonomy_lookup_for_mapping(
+            version=args.gtdb,
+            datasets=datasets,
+            base_dir=base_dir,
+            mirror=args.mirror,
+            verbose=args.verbose,
+            ensure_metadata=True,
+        )
         mapping_path = build_mapping_file(
             args.gtdb,
             base_dir=base_dir,
             mapping_file=args.mapping_file,
+            include_accessions=include_accessions,
+            taxonomy_lookup=taxonomy_lookup,
             show_progress=True,
         )
-        count = len(_collect_existing_genome_mappings(_get_shared_raw_genomes_dir(base_dir)))
+        count = sum(1 for _ in open(mapping_path, "r", encoding="utf-8"))
         print(f"Mapping file written to: {mapping_path}")
         print(f"Mapped genomes: {count}")
         return 0
-    
+
     # Handle --download flag (metadata only)
     if args.download:
-        print(f"Downloading metadata for {args.gtdb} ({args.dataset}) from {args.mirror}...")
         version_dir = setup_version_dir(args.gtdb, base_dir)
-        metadata_file = download_metadata(
-            args.gtdb,
-            args.dataset,
-            version_dir,
-            mirror=args.mirror,
-            verbose=args.verbose
-        )
-        if metadata_file:
-            print(f"✓ Metadata downloaded successfully")
-            return 0
-        else:
-            print(f"✗ Failed to download metadata", file=sys.stderr)
-            return 1
-    
+        datasets = ["bac120", "ar53"] if args.dataset == "all" else [args.dataset]
+        ok = True
+        for ds in datasets:
+            print(f"Downloading metadata for {args.gtdb} ({ds}) from {args.mirror}...")
+            metadata_file = download_metadata(
+                args.gtdb,
+                ds,
+                version_dir,
+                mirror=args.mirror,
+                verbose=args.verbose
+            )
+            if metadata_file:
+                print(f"✓ Metadata downloaded successfully for {ds}")
+            else:
+                print(f"✗ Failed to download metadata for {ds}", file=sys.stderr)
+                ok = False
+        return 0 if ok else 1
+
     # Handle taxon-based download
     if args.taxon:
-        print(f"Downloading genomes for taxon: {args.taxon}")
-        success = download_genomes_for_taxon(
-            args.taxon,
-            args.gtdb,
-            dataset=args.dataset,
-            mirror=args.mirror,
-            base_dir=base_dir,
-            output_dir=args.output,
-            flat=args.flat,
-            flag_rep=args.flag_rep,
-            only_rep=args.only_rep,
-            ignore_prefix=args.ignore_prefix,
-            failed_file=args.failed_file,
-            verbose=args.verbose,
-            dry_run=args.dry_run
-        )
-        if args.mapping_file is not None:
+        datasets = ["bac120", "ar53"] if args.dataset == "all" else [args.dataset]
+        overall_success = True
+        for ds in datasets:
+            print(f"Downloading genomes for taxon: {args.taxon} (dataset: {ds})")
+            success = download_genomes_for_taxon(
+                args.taxon,
+                args.gtdb,
+                dataset=ds,
+                mirror=args.mirror,
+                base_dir=base_dir,
+                output_dir=args.output,
+                flat=args.flat,
+                flag_rep=args.flag_rep,
+                only_rep=args.only_rep,
+                ignore_prefix=args.ignore_prefix,
+                failed_file=args.failed_file,
+                verbose=args.verbose,
+                dry_run=args.dry_run
+            )
+            overall_success = overall_success and success
+
+        # Optional project-specific mapping file after taxon runs.
+        if args.mapping_file is not None and not mapping_flag_without_value:
+            include_accessions = _collect_target_accessions_for_mapping(
+                version=args.gtdb,
+                datasets=datasets,
+                taxon=args.taxon,
+                only_rep=args.only_rep,
+                base_dir=base_dir,
+                mirror=args.mirror,
+                verbose=args.verbose,
+            )
+            taxonomy_lookup = _collect_taxonomy_lookup_for_mapping(
+                version=args.gtdb,
+                datasets=datasets,
+                base_dir=base_dir,
+                mirror=args.mirror,
+                verbose=args.verbose,
+                ensure_metadata=True,
+            )
             mapping_path = build_mapping_file(
                 args.gtdb,
                 base_dir=base_dir,
                 mapping_file=args.mapping_file,
+                include_accessions=include_accessions,
+                taxonomy_lookup=taxonomy_lookup,
                 show_progress=True,
             )
             print(f"Requested mapping file written to: {mapping_path}")
-        return 0 if success else 1
+        elif args.mapping_file is not None and mapping_flag_without_value:
+            print(f"Global mapping file: {_get_default_mapping_path(base_dir, args.gtdb)}")
+
+        return 0 if overall_success else 1
 
     # If neither --download nor --taxon, show help
     parser.print_help()
