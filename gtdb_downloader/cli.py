@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
+import requests
+
 from gtdb_downloader.config import get_base_dir, GTDB_VERSIONS
 from gtdb_downloader.downloader import (
     check_aria2c_available,
@@ -104,6 +106,55 @@ def _resolve_failed_path(base_dir: Path, version: str, failed_file: Optional[Pat
     if failed_file.is_absolute():
         return failed_file
     return default_dir / failed_file
+
+
+def _normalize_ncbi_accession(accession: str) -> Optional[str]:
+    """Normalize accession to NCBI GCA_/GCF_ form."""
+    if accession.startswith(("RS_", "GB_")):
+        accession = accession[3:]
+    if accession.startswith(("GCA_", "GCF_")):
+        return accession
+    return None
+
+
+def _extract_ncbi_accession(genome_id: str, genome_metadata: Optional[dict]) -> Optional[str]:
+    """Extract a normalized NCBI accession from metadata or genome id."""
+    if genome_metadata:
+        metadata_accession = genome_metadata.get("accession")
+        if isinstance(metadata_accession, str):
+            normalized = _normalize_ncbi_accession(metadata_accession)
+            if normalized:
+                return normalized
+    return _normalize_ncbi_accession(genome_id)
+
+
+def _fetch_ncbi_datasets_status(accession: str, timeout_seconds: int = 12) -> Tuple[str, Optional[str]]:
+    """
+    Fetch NCBI Datasets page and extract the "Status:" line if present.
+
+    Returns:
+        Tuple of (datasets_url, extracted_status_text_or_none)
+    """
+    datasets_url = f"https://www.ncbi.nlm.nih.gov/datasets/genome/{accession}/"
+    try:
+        response = requests.get(datasets_url, timeout=timeout_seconds)
+        response.raise_for_status()
+    except Exception:
+        return datasets_url, None
+
+    # Strip tags for a resilient plain-text search.
+    plain_text = re.sub(r"<[^>]+>", " ", response.text)
+    plain_text = re.sub(r"\s+", " ", plain_text)
+    match = re.search(r"Status:\s*(.{1,220}?)\s{1,}(?:This record|Actions|Download|datasets|API|FTP|$)", plain_text, re.IGNORECASE)
+    if match:
+        return datasets_url, match.group(1).strip()
+
+    idx = plain_text.lower().find("status:")
+    if idx >= 0:
+        snippet = plain_text[idx:idx + 240].strip()
+        return datasets_url, snippet
+
+    return datasets_url, None
 
 
 def _collect_existing_genome_mappings(genomes_dir: Path) -> Dict[str, Path]:
@@ -342,6 +393,8 @@ def download_genomes_for_taxon(
     failed_count = 0
     failed_genomes: List[str] = []
     failed_attempted_urls: Dict[str, List[str]] = {}
+    suppressed_genomes: List[str] = []
+    status_cache: Dict[str, Optional[str]] = {}
     existing_genomes = _index_existing_genomes(genomes_dir, ignore_prefix)
     total_genomes = len(matching_genomes)
     show_prep_progress = not verbose and total_genomes > 200
@@ -500,6 +553,22 @@ def download_genomes_for_taxon(
                 if verbose:
                     print(f"  Resolving fallback for {genome_id}...")
 
+                accession = _extract_ncbi_accession(genome_id, genome_metadata)  # type: ignore[arg-type]
+                if accession:
+                    if accession not in status_cache:
+                        _, status_text = _fetch_ncbi_datasets_status(accession)
+                        status_cache[accession] = status_text
+                    status_text = status_cache.get(accession)
+                    if status_text and "suppressed" in status_text.lower():
+                        datasets_url = f"https://www.ncbi.nlm.nih.gov/datasets/genome/{accession}/"
+                        suppressed_msg = (
+                            f"Status: {status_text} ({datasets_url}); "
+                            f"stopping further lookup for this genome"
+                        )
+                        print(suppressed_msg, file=sys.stderr)
+                        suppressed_genomes.append(genome_id)  # type: ignore[arg-type]
+                        continue
+
                 try:
                     fallback_url = resolve_download_link(
                         genome_metadata,
@@ -616,6 +685,8 @@ def download_genomes_for_taxon(
     
     print(f"\n✓ Downloaded: {downloaded_count}")
     print(f"✗ Failed: {failed_count}")
+    if suppressed_genomes:
+        print(f"Suppressed at NCBI Datasets: {len(set(suppressed_genomes))}")
     print(f"Genomes stored in: {genomes_dir}")
     print(f"Taxonomy structure in: {taxonomy_dir}")
     
