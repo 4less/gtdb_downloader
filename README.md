@@ -133,9 +133,9 @@ Available mirrors:
 
 When you download genomes for a taxon, genomes are stored centrally and symlinks are organized by taxonomy:
 
-**Data directory (central storage):**
+**Data directory (shared raw storage across GTDB versions):**
 ```
-~/.gtdb_downloader/r226/genomes/raw/
+~/.gtdb_downloader/raw/
 ├── GCA_023390935.1_ASM2339093v1_genomic.fna.gz
 ├── GCA_946488845.1_ERR4303201_bin.25_MetaWRAP_v1.1_MAG_genomic.fna.gz
 └── ... (all genomes from all projects)
@@ -153,7 +153,7 @@ Default (if `--output` not specified):
                 └── Clostridiaceae/
                     └── Clostridium/
                         └── Clostridium cuniculi/
-                            └── GCA_023390935.1_ASM2339093v1_genomic.fna.gz -> ~/.gtdb_downloader/r226/genomes/raw/...
+                            └── GCA_023390935.1_ASM2339093v1_genomic.fna.gz -> ~/.gtdb_downloader/raw/...
 ```
 
 With `--output /path/to/my_project`:
@@ -164,7 +164,7 @@ With `--output /path/to/my_project`:
         └── Clostridia/
             └── ... (same hierarchy)
                 └── Clostridium cuniculi/
-                    └── GCA_023390935.1_ASM2339093v1_genomic.fna.gz -> ~/.gtdb_downloader/r226/genomes/raw/...
+                    └── GCA_023390935.1_ASM2339093v1_genomic.fna.gz -> ~/.gtdb_downloader/raw/...
 ```
 
 **Benefits:**
@@ -174,7 +174,7 @@ With `--output /path/to/my_project`:
 - **Metadata file**: `~/.gtdb_downloader/r226/bac120_metadata_r226.tsv.gz`
 - **Mapping file**: `~/.gtdb_downloader/r226/accession_path_map.tsv`
 
-The accession mapping file is rebuilt from the actual contents of `genomes/raw/` after taxon downloads, so it reflects files that exist locally rather than predicted URLs.
+The accession mapping file is rebuilt from the actual contents of the shared `raw/` directory after taxon downloads, so it reflects files that exist locally rather than predicted URLs.
 
 ## Command Reference
 

@@ -44,6 +44,48 @@ def _get_default_mapping_path(base_dir: Path, version: str) -> Path:
     return base_dir / version / "accession_path_map.tsv"
 
 
+def _get_shared_raw_genomes_dir(base_dir: Path) -> Path:
+    """Return the shared raw genomes directory used by all GTDB versions."""
+    return base_dir / "raw"
+
+
+def _iter_legacy_raw_genomes_dirs(base_dir: Path) -> List[Path]:
+    """Return legacy per-version raw genome directories that still exist."""
+    legacy_dirs: List[Path] = []
+    for child in sorted(base_dir.iterdir()) if base_dir.exists() else []:
+        if not child.is_dir():
+            continue
+        legacy_raw = child / "genomes" / "raw"
+        if legacy_raw.is_dir():
+            legacy_dirs.append(legacy_raw)
+    return legacy_dirs
+
+
+def _populate_shared_raw_from_legacy(base_dir: Path, shared_raw_dir: Path, verbose: bool = False) -> int:
+    """
+    Backfill shared raw storage from legacy per-version raw directories.
+
+    Creates symlinks for missing files so existing downloads are reused without
+    duplicating data on disk.
+    """
+    linked_count = 0
+    for legacy_raw in _iter_legacy_raw_genomes_dirs(base_dir):
+        for legacy_genome in sorted(legacy_raw.glob("*.fna.gz")):
+            shared_path = shared_raw_dir / legacy_genome.name
+            if shared_path.exists():
+                continue
+            try:
+                shared_path.symlink_to(legacy_genome.resolve())
+                linked_count += 1
+            except Exception as exc:
+                if verbose:
+                    print(
+                        f"Warning: Could not link legacy genome {legacy_genome} -> {shared_path}: {exc}",
+                        file=sys.stderr,
+                    )
+    return linked_count
+
+
 def _resolve_mapping_path(base_dir: Path, version: str, mapping_file: Optional[Path]) -> Path:
     """Resolve mapping file path, using the default location when omitted or relative."""
     default_path = _get_default_mapping_path(base_dir, version)
@@ -81,7 +123,9 @@ def build_mapping_file(
     if base_dir is None:
         base_dir = get_base_dir()
 
-    genomes_dir = base_dir / version / "genomes" / "raw"
+    genomes_dir = _get_shared_raw_genomes_dir(base_dir)
+    genomes_dir.mkdir(parents=True, exist_ok=True)
+    _populate_shared_raw_from_legacy(base_dir, genomes_dir, verbose=show_progress)
     resolved_mapping_path = _resolve_mapping_path(base_dir, version, mapping_file)
     mappings = _collect_existing_genome_mappings(genomes_dir)
     resolved_mapping_path.parent.mkdir(parents=True, exist_ok=True)
@@ -166,7 +210,7 @@ def _find_existing_genome_path(
     normalized = accession[3:] if accession.startswith(("RS_", "GB_")) else accession
     for key in _get_accession_keys(normalized, ignore_prefix):
         path = existing_genomes.get(key)
-        if path is not None and path.exists():
+        if path is not None:
             return path
     return None
 
@@ -213,9 +257,12 @@ def download_genomes_for_taxon(
     
     version_dir = setup_version_dir(version, base_dir)
     
-    # Genomes always go to base_dir / version / genomes / raw
-    genomes_dir = base_dir / version / "genomes" / "raw"
+    # Genomes are shared across versions at base_dir / raw
+    genomes_dir = _get_shared_raw_genomes_dir(base_dir)
     genomes_dir.mkdir(parents=True, exist_ok=True)
+    linked_count = _populate_shared_raw_from_legacy(base_dir, genomes_dir, verbose=verbose)
+    if verbose and linked_count:
+        print(f"Linked {linked_count} legacy genomes into shared raw directory")
     
     # Symlink taxonomy structure goes to output_dir (or base_dir if not specified)
     if output_dir is None:
@@ -226,18 +273,23 @@ def download_genomes_for_taxon(
     taxonomy_dir.mkdir(parents=True, exist_ok=True)
     
     # Download metadata if needed
+    print("Preparing metadata...")
     metadata_file = download_metadata(version, dataset, version_dir, mirror=mirror, verbose=verbose)
     if metadata_file is None:
         return False
+    print(f"Metadata ready: {metadata_file}")
     
     # Parse metadata
+    print("Loading metadata into memory...")
     try:
         parser = MetadataParser(metadata_file)
     except Exception as e:
         print(f"Error parsing metadata: {e}", file=sys.stderr)
         return False
+    print("Metadata loaded")
     
     # Find matching genomes
+    print(f"Filtering genomes for taxon query: {taxon}")
     matching_genomes = parser.get_genomes_by_taxon(taxon)
     
     if not matching_genomes:
@@ -323,8 +375,13 @@ def download_genomes_for_taxon(
 
         genome_path = genomes_dir / genome_filename
         existing_genome_path = _find_existing_genome_path(existing_genomes, genome_metadata, ignore_prefix)
+        local_present = False
         if existing_genome_path is not None:
             genome_path = existing_genome_path
+            local_present = True
+        elif genome_path.exists():
+            # Fallback check for already-downloaded files not captured by accession index.
+            local_present = True
         is_species_rep = parser.is_species_cluster_representative(genome_id)
         cluster_rep = parser.get_species_cluster_representative(genome_id) or "unknown_cluster"
         downloadable.append({
@@ -332,6 +389,7 @@ def download_genomes_for_taxon(
             "taxonomy_str": taxonomy_str,
             "download_url": download_url,
             "genome_path": genome_path,
+            "local_present": local_present,
             "is_species_rep": is_species_rep,
             "cluster_rep": cluster_rep,
             "genome_metadata": genome_metadata,
@@ -341,7 +399,7 @@ def download_genomes_for_taxon(
         if flag_rep and is_species_rep:
             representative_by_cluster.setdefault(cluster_rep, []).append(genome_id)
 
-        if verbose and not genome_path.exists():
+        if verbose and not local_present:
             print(f"  Queued download: {download_url}")
 
     if flag_rep:
@@ -357,7 +415,7 @@ def download_genomes_for_taxon(
 
     batch_results: Dict[Path, bool] = {}
     pending_downloads = [
-        item for item in downloadable if not item["genome_path"].exists()  # type: ignore[union-attr]
+        item for item in downloadable if not item["local_present"]  # type: ignore[index]
     ]
 
     if pending_downloads:
@@ -381,7 +439,7 @@ def download_genomes_for_taxon(
                     item["genome_path"],
                 )
                 for item in chunk
-                if not item["genome_path"].exists()  # type: ignore[union-attr]
+                if not item["local_present"]  # type: ignore[index]
             ]
 
             if use_aria2:
@@ -406,7 +464,7 @@ def download_genomes_for_taxon(
             failed_chunk_items = [
                 item
                 for item in chunk
-                if not item["genome_path"].exists() and not batch_results.get(item["genome_path"], False)  # type: ignore[union-attr]
+                if not item["local_present"] and not batch_results.get(item["genome_path"], False)  # type: ignore[index]
             ]
 
             if not failed_chunk_items:
@@ -446,6 +504,7 @@ def download_genomes_for_taxon(
 
                 if fallback_path.exists():
                     batch_results[fallback_path] = True
+                    item["local_present"] = True
                     continue
 
                 fallback_downloads.append((fallback_url, fallback_path))
@@ -477,9 +536,10 @@ def download_genomes_for_taxon(
         genome_id = item["genome_id"]
         taxonomy_str = item["taxonomy_str"]
         genome_path = item["genome_path"]
+        local_present = bool(item.get("local_present", False))
         is_species_rep = item["is_species_rep"]
 
-        if not genome_path.exists() and not batch_results.get(genome_path, False):
+        if not local_present and not genome_path.exists() and not batch_results.get(genome_path, False):
             if verbose:
                 print(f"  Failed to download {genome_id}")
             failed_count += 1
@@ -658,7 +718,7 @@ Examples:
             mapping_file=args.mapping_file,
             show_progress=True,
         )
-        count = len(_collect_existing_genome_mappings(base_dir / args.gtdb / "genomes" / "raw"))
+        count = len(_collect_existing_genome_mappings(_get_shared_raw_genomes_dir(base_dir)))
         print(f"Mapping file written to: {mapping_path}")
         print(f"Mapped genomes: {count}")
         return 0
