@@ -19,6 +19,7 @@ GTDB_VERSIONS = {
     "r214": "release214/214.1",
     "r220": "release220/220.0",
     "r226": "release226/226.0",
+    "r232": "release232/232.0",
 }
 
 # GTDB datasets

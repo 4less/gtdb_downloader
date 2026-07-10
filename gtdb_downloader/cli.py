@@ -760,24 +760,13 @@ def download_genomes_for_taxon(
                 accession = _extract_ncbi_accession(genome_id, genome_metadata)  # type: ignore[arg-type]
                 if accession:
                     ncbi_checked_genomes += 1
-                    status_text = status_cache.get(accession)
-                    if status_text:
-                        failed_status_notes[genome_id] = f"status:{status_text}"
-                    else:
-                        failed_status_notes[genome_id] = "status:unavailable_or_not_found"
-                        ncbi_missing_status_genomes += 1
-                    if status_text and "suppressed" in status_text.lower():
-                        datasets_url = f"https://www.ncbi.nlm.nih.gov/datasets/genome/{accession}/"
-                        suppressed_msg = (
-                            f"Status: {status_text} ({datasets_url}); "
-                            f"stopping further lookup for this genome"
-                        )
-                        print(suppressed_msg, file=sys.stderr)
-                        suppressed_genomes.append(genome_id)  # type: ignore[arg-type]
-                        continue
-                else:
-                    failed_status_notes[genome_id] = "status:no_accession"
 
+                # The NCBI directory listing is authoritative: if a genome file
+                # exists on the FTP we download it regardless of the status
+                # heuristic, which has false positives (it reports plenty of
+                # *current* genomes as "suppressed"). Only when resolution
+                # genuinely finds no file do we record the NCBI status as the
+                # failure reason.
                 try:
                     fallback_url = resolve_download_link(
                         genome_metadata,
@@ -795,6 +784,24 @@ def download_genomes_for_taxon(
                             existing_genomes[key] = fallback_path
                     print(f"  Fallback resolved for {genome_id}: {fallback_filename}")
                 except Exception as e:
+                    # Unresolvable -- now (and only now) consult the NCBI status
+                    # to explain why, and flag genuinely-suppressed genomes.
+                    if accession:
+                        status_text = status_cache.get(accession)
+                        if status_text:
+                            failed_status_notes[genome_id] = f"status:{status_text}"
+                            if "suppressed" in status_text.lower():
+                                datasets_url = f"https://www.ncbi.nlm.nih.gov/datasets/genome/{accession}/"
+                                print(
+                                    f"Status: {status_text} ({datasets_url}); no downloadable file found",
+                                    file=sys.stderr,
+                                )
+                                suppressed_genomes.append(genome_id)  # type: ignore[arg-type]
+                        else:
+                            failed_status_notes[genome_id] = "status:unavailable_or_not_found"
+                            ncbi_missing_status_genomes += 1
+                    else:
+                        failed_status_notes[genome_id] = "status:no_accession"
                     if verbose:
                         print(f"  Fallback resolution failed for {genome_id}: {e}")
                     continue

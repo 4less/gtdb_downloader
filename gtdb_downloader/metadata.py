@@ -78,13 +78,15 @@ class MetadataParser:
         query_components = [part.strip() for part in query.split(";") if part.strip()]
         query_components_lower = [part.lower() for part in query_components]
 
+
+
         def _strip_rank_prefix(component: str) -> str:
             if "__" in component:
                 return component.split("__", 1)[1]
             return component
 
         query_names_lower = [_strip_rank_prefix(part).lower() for part in query_components]
-        
+
         for genome_id, row in self.data.items():
             taxonomy = row.get(field, "")
             if not taxonomy:

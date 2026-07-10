@@ -37,6 +37,18 @@ def check_wget_available() -> bool:
         return False
 
 
+def _sanitize_assembly_name(name: str) -> str:
+    """Match NCBI's FTP naming of the assembly directory/file.
+
+    NCBI builds ``{accession}_{asm_name}`` by replacing every character in the
+    assembly name that is not a letter, digit, '.', '_' or '-' with '_'. Many
+    assembly names contain spaces (e.g. "IMG-taxon 2693429916 annotated
+    assembly") or other punctuation; inserting them verbatim yields a URL with
+    spaces that 404s even though the genome is present.
+    """
+    return re.sub(r"[^A-Za-z0-9._-]", "_", name)
+
+
 def generate_download_link(genome_metadata: dict, accession_override: Optional[str] = None) -> str:
     """
     Generate a download link for a specific genome from NCBI
@@ -55,7 +67,11 @@ def generate_download_link(genome_metadata: dict, accession_override: Optional[s
     
     if not accession or not assembly_name:
         raise ValueError(f"Missing required fields for genome: accession={accession}, assembly_name={assembly_name}")
-    
+
+    # NCBI replaces spaces/punctuation in the assembly name with '_' in the
+    # FTP path; do the same or the synthesized URL 404s on names with spaces.
+    assembly_name = _sanitize_assembly_name(assembly_name)
+
     # Parse accession: RS_GCF_034719275.1 or GB_GCA_034719275.1
     if accession.startswith("RS_"):
         # RefSeq
