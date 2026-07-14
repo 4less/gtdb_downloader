@@ -324,9 +324,13 @@ def _collect_taxonomy_lookup_for_mapping(
     mirror: str,
     verbose: bool,
     ensure_metadata: bool = False,
-) -> Dict[str, str]:
-    """Build accession -> taxonomy mapping from GTDB metadata."""
-    lookup: Dict[str, str] = {}
+) -> Dict[str, Tuple[str, str]]:
+    """Build accession -> (taxonomy, is_representative) mapping from GTDB metadata.
+
+    ``is_representative`` is "1" if the genome is its species-cluster
+    representative, "0" otherwise.
+    """
+    lookup: Dict[str, Tuple[str, str]] = {}
     version_dir = setup_version_dir(version, base_dir)
 
     for dataset in datasets:
@@ -349,8 +353,9 @@ def _collect_taxonomy_lookup_for_mapping(
             normalized = _normalize_mapping_accession(accession)
             if not normalized:
                 continue
-            # Keep first seen taxonomy for a stable map.
-            lookup.setdefault(normalized, taxonomy)
+            is_rep = "1" if parser.is_species_cluster_representative(accession) else "0"
+            # Keep first seen entry for a stable map.
+            lookup.setdefault(normalized, (taxonomy, is_rep))
 
     return lookup
 
@@ -360,7 +365,7 @@ def build_mapping_file(
     base_dir: Optional[Path] = None,
     mapping_file: Optional[Path] = None,
     include_accessions: Optional[set] = None,
-    taxonomy_lookup: Optional[Dict[str, str]] = None,
+    taxonomy_lookup: Optional[Dict[str, Tuple[str, str]]] = None,
     show_progress: bool = False,
 ) -> Path:
     """Create or refresh the accession-to-path mapping file from existing genomes."""
@@ -383,9 +388,10 @@ def build_mapping_file(
     with open(tmp_path, "w", encoding="utf-8") as handle:
         for count, (accession, genome_path) in enumerate(sorted(mappings.items()), start=1):
             taxonomy = ""
+            is_representative = "0"
             if taxonomy_lookup is not None:
-                taxonomy = taxonomy_lookup.get(accession, "")
-            handle.write(f"{accession}\t{genome_path}\t{taxonomy}\n")
+                taxonomy, is_representative = taxonomy_lookup.get(accession, ("", "0"))
+            handle.write(f"{accession}\t{genome_path}\t{taxonomy}\t{is_representative}\n")
             if show_progress and count % 1000 == 0:
                 print(f"  Mapped {count} genomes...")
 
@@ -1032,7 +1038,8 @@ Examples:
         const=Path("accession_path_map.tsv"),
         type=Path,
         help=(
-            "Write or refresh a TSV mapping file (col1 accession, col2 local raw genome path, col3 taxonomy). "
+            "Write or refresh a TSV mapping file (col1 accession, col2 local raw genome path, col3 taxonomy, "
+            "col4 is_representative [1/0]). "
             "With no file value, print the global mapping file path for the selected version. "
             "Relative custom paths are resolved from the current working directory."
         )
