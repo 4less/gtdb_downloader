@@ -47,6 +47,12 @@ cd /path/to/gtdb_downloader
 pip install -e .
 ```
 
+If you have [just](https://github.com/casey/just) installed, the same thing:
+
+```bash
+just install
+```
+
 This will:
 1. Install the `gtdb-dl` command to your PATH
 2. Create a base directory at `~/.gtdb_downloader` for storing GTDB data
