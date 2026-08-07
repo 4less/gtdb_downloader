@@ -43,6 +43,60 @@ def _get_symlink_name(genome_filename: str, is_species_rep: bool, flag_rep: bool
     return genome_filename + ".speciesrep.fna.gz"
 
 
+_ACCESSION_FILE_SUFFIXES = (".txt", ".tsv", ".csv", ".list", ".lst")
+
+
+def _looks_like_accession_file(value: str) -> bool:
+    """Heuristic: does this --accessions value name a file rather than an accession?"""
+    if "/" in value or "\\" in value or value.startswith("~"):
+        return True
+    return Path(value).suffix.lower() in _ACCESSION_FILE_SUFFIXES
+
+
+def _read_accession_file(path: Path) -> List[str]:
+    """Read accessions from a text/TSV file (first column, '#' comments ignored)."""
+    accessions: List[str] = []
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            content = line.split("#", 1)[0].strip()
+            if not content:
+                continue
+            accessions.append(content.split()[0])
+    return accessions
+
+
+def _load_accession_queries(values: List[str]) -> List[str]:
+    """
+    Expand --accessions values into a de-duplicated list of accessions.
+
+    Each value is either a path to a file listing accessions (one per line) or
+    a literal accession, optionally comma-separated.
+
+    Raises:
+        FileNotFoundError: If a value looks like a file path but does not exist
+    """
+    queries: List[str] = []
+    seen: set = set()
+
+    for value in values:
+        candidate = Path(value).expanduser()
+        if candidate.is_file():
+            raw_items = _read_accession_file(candidate)
+        elif _looks_like_accession_file(value):
+            raise FileNotFoundError(f"Accession list file not found: {value}")
+        else:
+            raw_items = [value]
+
+        for item in raw_items:
+            for accession in item.split(","):
+                accession = accession.strip()
+                if accession and accession not in seen:
+                    seen.add(accession)
+                    queries.append(accession)
+
+    return queries
+
+
 def _get_default_mapping_path(base_dir: Path, version: str) -> Path:
     """Return the default accession-to-path mapping file location."""
     return base_dir / version / "accession_path_map.tsv"
@@ -282,13 +336,15 @@ def _collect_target_accessions_for_mapping(
     base_dir: Path,
     mirror: str,
     verbose: bool,
+    accessions: Optional[List[str]] = None,
+    ignore_prefix: bool = False,
 ) -> Optional[set]:
     """
     Collect normalized accession keys for custom mapping subsets.
 
     Returns None when no filtering is needed (full map).
     """
-    if taxon is None and not only_rep:
+    if taxon is None and not only_rep and not accessions:
         return None
 
     target_accessions: set = set()
@@ -299,7 +355,15 @@ def _collect_target_accessions_for_mapping(
         if metadata_file is None:
             continue
         parser = MetadataParser(metadata_file)
-        genome_ids = parser.get_genomes_by_taxon(taxon) if taxon else list(parser.data.keys())
+        if taxon is None and not accessions:
+            genome_ids = list(parser.data.keys())
+        else:
+            genome_ids = parser.get_genomes_by_taxon(taxon) if taxon else []
+            if accessions:
+                matched_ids, _ = parser.get_genomes_by_accessions(
+                    accessions, ignore_prefix=ignore_prefix
+                )
+                genome_ids = list(dict.fromkeys([*genome_ids, *matched_ids]))
         if only_rep:
             genome_ids = [gid for gid in genome_ids if parser.is_species_cluster_representative(gid)]
         for genome_id in genome_ids:
@@ -477,9 +541,10 @@ def setup_version_dir(version: str, base_dir: Path) -> Path:
     return version_dir
 
 
-def download_genomes_for_taxon(
-    taxon: str,
+def download_genomes(
     version: str,
+    taxon: Optional[str] = None,
+    accessions: Optional[List[str]] = None,
     dataset: str = "bac120",
     mirror: str = "europe",
     base_dir: Optional[Path] = None,
@@ -490,24 +555,38 @@ def download_genomes_for_taxon(
     ignore_prefix: bool = False,
     failed_file: Optional[Path] = None,
     verbose: bool = False,
-    dry_run: bool = False
+    dry_run: bool = False,
+    resolved_accessions: Optional[set] = None
 ) -> bool:
     """
-    Download all genomes for a specific taxon
-    
+    Download genomes selected by taxon and/or by explicit accession
+
     Args:
-        taxon: Taxon to search for
         version: GTDB version
+        taxon: Taxon to search for (optional if accessions are given)
+        accessions: Explicit list of assembly accessions to download
         dataset: Dataset type (bac120 or ar53)
         mirror: Mirror to use for download
         base_dir: Base directory for GTDB data
         output_dir: Output directory for symlink taxonomy structure (not genomes)
+        flat: Rank at which to build a flat symlink structure
+        flag_rep: Tag species representatives in symlink names
+        only_rep: Restrict the selection to species representatives
+        ignore_prefix: Treat GCA_/GCF_ prefixes as interchangeable
+        failed_file: Where to write the failed-genome report
         verbose: Verbose output
         dry_run: Don't actually download, just show what would be downloaded
-    
+        resolved_accessions: Optional set updated with the requested accessions
+            that were found in this dataset (used to report unknown accessions
+            once all datasets have been searched)
+
     Returns:
         True if successful, False otherwise
     """
+    if not taxon and not accessions:
+        print("Error: Either a taxon or a list of accessions is required", file=sys.stderr)
+        return False
+
     if base_dir is None:
         base_dir = get_base_dir()
     
@@ -545,12 +624,42 @@ def download_genomes_for_taxon(
     print("Metadata loaded")
     
     # Find matching genomes
-    print(f"Filtering genomes for taxon query: {taxon}")
-    matching_genomes = parser.get_genomes_by_taxon(taxon)
-    
+    matching_genomes: List[str] = []
+
+    if taxon:
+        print(f"Filtering genomes for taxon query: {taxon}")
+        matching_genomes.extend(parser.get_genomes_by_taxon(taxon))
+        if not matching_genomes:
+            message = f"No genomes found for taxon: {taxon} (dataset: {dataset})"
+            if not accessions:
+                print(message, file=sys.stderr)
+                return False
+            print(message)
+
+    if accessions:
+        print(f"Matching {len(accessions)} requested accessions against {dataset} metadata...")
+        accession_genomes, matched_queries = parser.get_genomes_by_accessions(
+            accessions, ignore_prefix=ignore_prefix
+        )
+        if resolved_accessions is not None:
+            resolved_accessions.update(matched_queries)
+        print(f"Matched {len(accession_genomes)} genomes by accession")
+        matching_genomes.extend(accession_genomes)
+
+    # De-duplicate while keeping selection order (taxon hits may overlap accessions).
+    matching_genomes = list(dict.fromkeys(matching_genomes))
+
+    label_parts = []
+    if taxon:
+        label_parts.append(f"taxon: {taxon}")
+    if accessions:
+        label_parts.append("requested accessions")
+    selection_label = " + ".join(label_parts)
+
     if not matching_genomes:
-        print(f"No genomes found for taxon: {taxon}", file=sys.stderr)
-        return False
+        print(f"No genomes in dataset {dataset} matched the requested accessions")
+        # Accession-only queries commonly match just one dataset; that is not a failure.
+        return True
 
     if only_rep:
         matching_genomes = [
@@ -560,13 +669,13 @@ def download_genomes_for_taxon(
         ]
         if not matching_genomes:
             print(
-                f"No species representative genomes found for taxon: {taxon}",
+                f"No species representative genomes found for {selection_label}",
                 file=sys.stderr,
             )
             return False
-    
-    print(f"Found {len(matching_genomes)} genomes for taxon: {taxon}")
-    
+
+    print(f"Found {len(matching_genomes)} genomes for {selection_label}")
+
     if verbose:
         print(f"Dataset: {dataset}")
         print(f"Version: {version}")
@@ -952,6 +1061,11 @@ def download_genomes_for_taxon(
     return failed_count == 0
 
 
+def download_genomes_for_taxon(taxon: str, version: str, **kwargs) -> bool:
+    """Backwards-compatible wrapper around :func:`download_genomes`."""
+    return download_genomes(version, taxon=taxon, **kwargs)
+
+
 def main():
     """Main entry point for CLI"""
     parser = argparse.ArgumentParser(
@@ -967,6 +1081,12 @@ Examples:
 
   # Download with verbose output
   gtdb-dl --gtdb r226 --taxon "d__Bacteria;p__Bacillota" -v
+
+  # Download a specific list of assemblies
+  gtdb-dl --gtdb r226 --accessions GCF_000970205.1 GCA_023390935.1
+
+  # Download the assemblies listed in a file (one accession per line)
+  gtdb-dl --gtdb r226 --accessions my_accessions.txt
 
   # Set custom base directory
   GTDBDL_DATA=/data/gtdb gtdb-dl --gtdb r226 --taxon "Archaea"
@@ -988,6 +1108,18 @@ Examples:
         )
     )
     
+    parser.add_argument(
+        "--accessions",
+        nargs="+",
+        metavar="ACCESSION|FILE",
+        help=(
+            "Download a specific list of assemblies instead of (or in addition to) a taxon. "
+            "Each value is either an accession or a file listing one accession per line "
+            "(first column used, '#' comments ignored). Accessions may be given as "
+            "GCF_000970205.1, GCA_000970205, or RS_GCF_000970205.1."
+        )
+    )
+
     parser.add_argument(
         "--dataset",
         choices=["bac120", "ar53", "all"],
@@ -1091,11 +1223,24 @@ Examples:
             break
 
     base_dir = args.base_dir or get_base_dir()
-    
+
     if args.verbose:
         print(f"Using base directory: {base_dir}")
 
-    if args.mapping_file is not None and not args.taxon and not args.download:
+    accession_queries: List[str] = []
+    if args.accessions:
+        try:
+            accession_queries = _load_accession_queries(args.accessions)
+        except OSError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        if not accession_queries:
+            print("Error: No accessions found in --accessions input", file=sys.stderr)
+            return 1
+        if args.verbose:
+            print(f"Requested accessions: {len(accession_queries)}")
+
+    if args.mapping_file is not None and not args.taxon and not accession_queries and not args.download:
         if mapping_flag_without_value:
             print(f"Global mapping file: {_get_default_mapping_path(base_dir, args.gtdb)}")
             return 0
@@ -1152,15 +1297,25 @@ Examples:
                 ok = False
         return 0 if ok else 1
 
-    # Handle taxon-based download
-    if args.taxon:
+    # Handle taxon- and/or accession-based download
+    if args.taxon or accession_queries:
         datasets = ["bac120", "ar53"] if args.dataset == "all" else [args.dataset]
         overall_success = True
+        resolved_accessions: set = set()
+
+        selection_parts = []
+        if args.taxon:
+            selection_parts.append(f"taxon: {args.taxon}")
+        if accession_queries:
+            selection_parts.append(f"{len(accession_queries)} requested accessions")
+        selection_desc = ", ".join(selection_parts)
+
         for ds in datasets:
-            print(f"Downloading genomes for taxon: {args.taxon} (dataset: {ds})")
-            success = download_genomes_for_taxon(
-                args.taxon,
+            print(f"Downloading genomes for {selection_desc} (dataset: {ds})")
+            success = download_genomes(
                 args.gtdb,
+                taxon=args.taxon,
+                accessions=accession_queries or None,
                 dataset=ds,
                 mirror=args.mirror,
                 base_dir=base_dir,
@@ -1171,11 +1326,40 @@ Examples:
                 ignore_prefix=args.ignore_prefix,
                 failed_file=args.failed_file,
                 verbose=args.verbose,
-                dry_run=args.dry_run
+                dry_run=args.dry_run,
+                resolved_accessions=resolved_accessions
             )
             overall_success = overall_success and success
 
-        # Optional project-specific mapping file after taxon runs.
+            # Pure accession queries need no further datasets once everything matched
+            # (parsing the bac120 metadata is expensive).
+            if (
+                accession_queries
+                and not args.taxon
+                and len(resolved_accessions) == len(accession_queries)
+            ):
+                break
+
+        if accession_queries:
+            unknown = [acc for acc in accession_queries if acc not in resolved_accessions]
+            if unknown:
+                print(
+                    f"\n✗ {len(unknown)} requested accessions not found in "
+                    f"GTDB {args.gtdb} metadata:",
+                    file=sys.stderr,
+                )
+                for accession in unknown[:20]:
+                    print(f"  - {accession}", file=sys.stderr)
+                if len(unknown) > 20:
+                    print(f"  ... and {len(unknown) - 20} more", file=sys.stderr)
+                if not args.ignore_prefix:
+                    print(
+                        "  (try --ignore-prefix to match GCA_/GCF_ counterparts)",
+                        file=sys.stderr,
+                    )
+                overall_success = False
+
+        # Optional project-specific mapping file after download runs.
         if args.mapping_file is not None and not mapping_flag_without_value:
             include_accessions = _collect_target_accessions_for_mapping(
                 version=args.gtdb,
@@ -1185,6 +1369,8 @@ Examples:
                 base_dir=base_dir,
                 mirror=args.mirror,
                 verbose=args.verbose,
+                accessions=accession_queries or None,
+                ignore_prefix=args.ignore_prefix,
             )
             taxonomy_lookup = _collect_taxonomy_lookup_for_mapping(
                 version=args.gtdb,

@@ -4,7 +4,7 @@ import csv
 import gzip
 import tarfile
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, Iterable, List, Set, Tuple, Optional
 import io
 
 
@@ -20,6 +20,8 @@ class MetadataParser:
         """
         self.metadata_path = Path(metadata_path)
         self.data = {}
+        self._accession_index: Optional[Dict[str, str]] = None
+        self._accession_suffix_index: Optional[Dict[str, str]] = None
         self._load_metadata()
     
     def _load_metadata(self):
@@ -132,6 +134,92 @@ class MetadataParser:
         
         return matching_genomes
     
+    @staticmethod
+    def _strip_accession_version(accession: str) -> str:
+        """Drop the trailing assembly version (GCF_000970205.1 -> GCF_000970205)."""
+        return accession.split(".", 1)[0]
+
+    def _build_accession_index(self) -> None:
+        """
+        Build lookup tables from accession spellings to genome IDs.
+
+        Two tables are built: one keyed by the normalized accession (with and
+        without the assembly version) and one keyed by the numeric part only,
+        so GCA_/GCF_ prefixes can be treated as interchangeable on request.
+        """
+        exact: Dict[str, str] = {}
+        by_suffix: Dict[str, str] = {}
+
+        for genome_id, row in self.data.items():
+            raw_accession = row.get("accession") or row.get("Genome") or genome_id
+            normalized = self._normalize_accession(str(raw_accession).upper())
+            if not normalized:
+                continue
+
+            exact.setdefault(normalized, genome_id)
+            exact.setdefault(self._strip_accession_version(normalized), genome_id)
+
+            if normalized.startswith(("GCA_", "GCF_")):
+                suffix = normalized[4:]
+                by_suffix.setdefault(suffix, genome_id)
+                by_suffix.setdefault(self._strip_accession_version(suffix), genome_id)
+
+        self._accession_index = exact
+        self._accession_suffix_index = by_suffix
+
+    def get_genomes_by_accessions(
+        self,
+        accessions: Iterable[str],
+        ignore_prefix: bool = False,
+    ) -> Tuple[List[str], Set[str]]:
+        """
+        Look up genomes by accession.
+
+        Accepts GTDB (RS_/GB_ prefixed) and plain NCBI accessions, with or
+        without the assembly version suffix, in any capitalization.
+
+        Args:
+            accessions: Requested accessions
+            ignore_prefix: Treat GCA_ and GCF_ as interchangeable
+
+        Returns:
+            Tuple of (matching genome IDs, set of requested accessions that matched)
+        """
+        if self._accession_index is None or self._accession_suffix_index is None:
+            self._build_accession_index()
+
+        genome_ids: List[str] = []
+        matched_queries: Set[str] = set()
+        seen_genomes: Set[str] = set()
+
+        for query in accessions:
+            key = self._normalize_accession(str(query).upper())
+            if not key:
+                continue
+
+            genome_id = None
+            for candidate in (key, self._strip_accession_version(key)):
+                genome_id = self._accession_index.get(candidate)
+                if genome_id is not None:
+                    break
+
+            if genome_id is None and ignore_prefix and key.startswith(("GCA_", "GCF_")):
+                suffix = key[4:]
+                for candidate in (suffix, self._strip_accession_version(suffix)):
+                    genome_id = self._accession_suffix_index.get(candidate)
+                    if genome_id is not None:
+                        break
+
+            if genome_id is None:
+                continue
+
+            matched_queries.add(query)
+            if genome_id not in seen_genomes:
+                seen_genomes.add(genome_id)
+                genome_ids.append(genome_id)
+
+        return genome_ids, matched_queries
+
     def get_genome_metadata(self, genome_id: str) -> Optional[dict]:
         """
         Get the full metadata row for a genome

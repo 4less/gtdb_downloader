@@ -9,6 +9,7 @@ This script was developed with the help of ChatGPT.
 
 - Download GTDB metadata and genomes for multiple versions (r207, r214, r220, r226)
 - Search for genomes by exact taxon name/component
+- Download an explicit list of assemblies/accessions (inline or from a file)
 - Automatic metadata download on first use
 - Multiple mirror support (Europe, Asia-Pacific)
 - Download genomes using aria2 (with wget fallback)
@@ -109,6 +110,54 @@ gtdb-dl --gtdb r226 --mapping-file
 gtdb-dl --gtdb r226 --mapping-file /path/to/accession_path_map.tsv
 ```
 
+### Download a specific list of assemblies
+
+When you already know which assemblies you need, pass them with `--accessions`
+instead of (or in addition to) `--taxon`. Each value is either an accession or a
+file listing accessions:
+
+```bash
+# Inline accessions
+gtdb-dl --gtdb r226 --accessions GCF_000970205.1 GCA_023390935.1
+
+# Comma-separated also works
+gtdb-dl --gtdb r226 --accessions GCF_000970205.1,GCA_023390935.1
+
+# From a file (one accession per line)
+gtdb-dl --gtdb r226 --accessions my_accessions.txt --output genomes
+
+# Combine a file and extra accessions, and restrict to one dataset
+gtdb-dl --gtdb r226 --dataset ar53 --accessions my_accessions.txt GCA_003163595.1
+
+# Match GCA_/GCF_ counterparts (e.g. you have GCA_ but GTDB lists GCF_)
+gtdb-dl --gtdb r226 --accessions GCA_000485535.1 --ignore-prefix
+```
+
+The accession list file may contain comments and extra columns; only the first
+whitespace-separated column is used:
+
+```
+# my project genomes
+GCF_000970205.1
+GCA_023390935.1    optional notes are ignored
+```
+
+Accessions are accepted in any of these spellings, in any capitalization:
+
+- `GCF_000970205.1` (NCBI accession with version)
+- `GCF_000970205` (version omitted)
+- `RS_GCF_000970205.1` / `GB_GCA_023390935.1` (GTDB-prefixed)
+
+By default both datasets are searched, starting with `bac120`; the search stops
+as soon as every requested accession has been found. If you know your
+accessions are archaeal, `--dataset ar53` avoids parsing the large bacterial
+metadata file.
+
+Downloaded genomes land in the shared `raw/` directory and get the same
+taxonomy symlink structure as taxon downloads. Accessions that are not present
+in the selected GTDB release are listed at the end of the run and cause a
+non-zero exit code.
+
 ### Custom base directory
 
 By default, data is stored in `~/.gtdb_downloader`. Change this with an environment variable:
@@ -180,6 +229,7 @@ The accession mapping file is rebuilt from the actual contents of the shared `ra
 
 ```
 usage: gtdb-dl [-h] --gtdb {r207,r214,r220,r226} [--taxon TAXON]
+               [--accessions ACCESSION|FILE [ACCESSION|FILE ...]]
                [--dataset {bac120,ar53}] [--mirror {europe,asia-pacific1,asia-pacific2}]
                [--flat {domain,phylum,class,order,family,genus,species,d,p,c,o,f,g,s}]
                [--flag-rep] [--only-rep] [--ignore-prefix] [--output OUTPUT] [--mapping-file [MAPPING_FILE]]
@@ -190,6 +240,8 @@ optional arguments:
   -h, --help                              show this help message and exit
   --gtdb {r207,r214,r220,r226}            GTDB version to use (required)
   --taxon TAXON                           Taxon to search for (supports comma-separated OR queries)
+  --accessions ACCESSION|FILE [...]       Download a specific list of assemblies; each value is an
+                                          accession or a file listing one accession per line
   --dataset {bac120,ar53}                 Dataset type (default: bac120)
   --mirror {europe,asia-pacific1,asia-pacific2}  Mirror to download from (default: europe)
   --flat {domain,phylum,class,order,family,genus,species,d,p,c,o,f,g,s}
