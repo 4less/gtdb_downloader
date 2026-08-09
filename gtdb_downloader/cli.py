@@ -5,13 +5,14 @@ import concurrent.futures
 import json
 import re
 import sys
+import tarfile
 import time
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
 
 import requests
 
-from gtdb_downloader.config import get_base_dir, GTDB_VERSIONS
+from gtdb_downloader.config import get_base_dir, get_marker_genes_url, GTDB_VERSIONS
 from gtdb_downloader.downloader import (
     check_aria2c_available,
     download_file,
@@ -20,7 +21,21 @@ from gtdb_downloader.downloader import (
     generate_download_links,
     resolve_download_link,
 )
-from gtdb_downloader.metadata import MetadataParser
+from gtdb_downloader.metadata import MetadataParser, GENOME_TYPE_CATEGORIES
+
+
+MGNIFY_API_BASE = "https://www.ebi.ac.uk/metagenomics/api/v1"
+
+# Mapping files share a common column layout. ``is_representative`` is "1" when the
+# genome is its species-cluster representative, "0" otherwise; ``genome_length`` is
+# always the full genome size from metadata, even in the marker-gene mapping.
+MAPPING_HEADER = "accession\tgenome_path\tgtdb_taxonomy\tis_representative\tgenome_length\n"
+MG_MAPPING_HEADER = (
+    "accession\tconcatenated_fna_path\tgtdb_taxonomy\tis_representative\tgenome_length\n"
+)
+MG_DIR_MAPPING_HEADER = (
+    "accession\tmarker_genes_dir\tgtdb_taxonomy\tis_representative\tgenome_length\n"
+)
 
 
 def _sanitize_name(name: str) -> str:
@@ -388,13 +403,15 @@ def _collect_taxonomy_lookup_for_mapping(
     mirror: str,
     verbose: bool,
     ensure_metadata: bool = False,
-) -> Dict[str, Tuple[str, str]]:
-    """Build accession -> (taxonomy, is_representative) mapping from GTDB metadata.
+) -> Tuple[Dict[str, Tuple[str, str]], Dict[str, str]]:
+    """Build accession -> (taxonomy, is_representative) and accession -> genome_length
+    mappings from GTDB metadata.
 
     ``is_representative`` is "1" if the genome is its species-cluster
     representative, "0" otherwise.
     """
     lookup: Dict[str, Tuple[str, str]] = {}
+    length_lookup: Dict[str, str] = {}
     version_dir = setup_version_dir(version, base_dir)
 
     for dataset in datasets:
@@ -418,10 +435,11 @@ def _collect_taxonomy_lookup_for_mapping(
             if not normalized:
                 continue
             is_rep = "1" if parser.is_species_cluster_representative(accession) else "0"
-            # Keep first seen entry for a stable map.
+            # Keep first seen values for a stable map.
             lookup.setdefault(normalized, (taxonomy, is_rep))
+            length_lookup.setdefault(normalized, str(genome_metadata.get("genome_size", "")))
 
-    return lookup
+    return lookup, length_lookup
 
 
 def build_mapping_file(
@@ -430,6 +448,7 @@ def build_mapping_file(
     mapping_file: Optional[Path] = None,
     include_accessions: Optional[set] = None,
     taxonomy_lookup: Optional[Dict[str, Tuple[str, str]]] = None,
+    genome_length_lookup: Optional[Dict[str, str]] = None,
     show_progress: bool = False,
 ) -> Path:
     """Create or refresh the accession-to-path mapping file from existing genomes."""
@@ -450,12 +469,18 @@ def build_mapping_file(
         print(f"Building mapping file from: {genomes_dir}")
 
     with open(tmp_path, "w", encoding="utf-8") as handle:
+        handle.write(MAPPING_HEADER)
         for count, (accession, genome_path) in enumerate(sorted(mappings.items()), start=1):
             taxonomy = ""
             is_representative = "0"
             if taxonomy_lookup is not None:
                 taxonomy, is_representative = taxonomy_lookup.get(accession, ("", "0"))
-            handle.write(f"{accession}\t{genome_path}\t{taxonomy}\t{is_representative}\n")
+            genome_length = ""
+            if genome_length_lookup is not None:
+                genome_length = genome_length_lookup.get(accession, "")
+            handle.write(
+                f"{accession}\t{genome_path}\t{taxonomy}\t{is_representative}\t{genome_length}\n"
+            )
             if show_progress and count % 1000 == 0:
                 print(f"  Mapped {count} genomes...")
 
@@ -556,7 +581,8 @@ def download_genomes(
     failed_file: Optional[Path] = None,
     verbose: bool = False,
     dry_run: bool = False,
-    resolved_accessions: Optional[set] = None
+    resolved_accessions: Optional[set] = None,
+    genome_type: Optional[str] = None,
 ) -> bool:
     """
     Download genomes selected by taxon and/or by explicit accession
@@ -579,6 +605,8 @@ def download_genomes(
         resolved_accessions: Optional set updated with the requested accessions
             that were found in this dataset (used to report unknown accessions
             once all datasets have been searched)
+        genome_type: Restrict to a genome source category ("isolate", "mag",
+            "sag", "env"); "all" or None keeps every genome
 
     Returns:
         True if successful, False otherwise
@@ -674,7 +702,17 @@ def download_genomes(
             )
             return False
 
+    if genome_type and genome_type != "all":
+        matching_genomes = parser.filter_by_genome_type(matching_genomes, genome_type)
+        if not matching_genomes:
+            print(
+                f"No {genome_type} genomes found for {selection_label}",
+                file=sys.stderr,
+            )
+            return False
+
     print(f"Found {len(matching_genomes)} genomes for {selection_label}")
+
 
     if verbose:
         print(f"Dataset: {dataset}")
@@ -1012,7 +1050,7 @@ def download_genomes(
         
         downloaded_count += 1
 
-    taxonomy_lookup = _collect_taxonomy_lookup_for_mapping(
+    taxonomy_lookup, genome_length_lookup = _collect_taxonomy_lookup_for_mapping(
         version=version,
         datasets=["bac120", "ar53"],
         base_dir=base_dir,
@@ -1024,6 +1062,7 @@ def download_genomes(
         version,
         base_dir=base_dir,
         taxonomy_lookup=taxonomy_lookup,
+        genome_length_lookup=genome_length_lookup,
         show_progress=verbose,
     )
     print(f"Mapping file written to: {mapping_path}")
@@ -1064,6 +1103,385 @@ def download_genomes(
 def download_genomes_for_taxon(taxon: str, version: str, **kwargs) -> bool:
     """Backwards-compatible wrapper around :func:`download_genomes`."""
     return download_genomes(version, taxon=taxon, **kwargs)
+
+
+def _concat_marker_genes_for_dataset(
+    extracted_dir: Path,
+    verbose: bool = False,
+) -> Optional[Path]:
+    """Create one FASTA file per genome containing one record per marker gene.
+
+    Processes one marker file at a time — only that marker's sequences are kept
+    in memory at once. Each output file gets 120 records (one per marker present),
+    in consistent sorted-filename order, suitable for per-marker MSA preparation.
+    RS_/GB_ prefixes are stripped from output filenames.
+    Returns the output directory, or None if marker genes are not found.
+    """
+    fna_dir = extracted_dir / "fna"
+    if not fna_dir.exists():
+        return None
+
+    fna_files = sorted(fna_dir.glob("*.fna"))
+    if not fna_files:
+        print(f"No .fna files found in {fna_dir}", file=sys.stderr)
+        return None
+
+    output_dir = extracted_dir / "concatenated"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Processing {len(fna_files)} marker files from {fna_dir}...")
+    genome_count = 0
+
+    for i, fna_file in enumerate(fna_files, 1):
+        marker_name = fna_file.stem
+        if verbose:
+            print(f"  [{i}/{len(fna_files)}] {fna_file.name}")
+        elif i == 1 or i == len(fna_files) or i % 10 == 0:
+            print(f"  Marker {i}/{len(fna_files)}: {fna_file.name}", flush=True)
+
+        # Read this one marker's sequences into memory (~200 MB peak, then discarded)
+        marker_seqs: Dict[str, str] = {}
+        current_acc: Optional[str] = None
+        current_seq: List[str] = []
+        with open(fna_file, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.rstrip()
+                if line.startswith(">"):
+                    if current_acc is not None:
+                        marker_seqs[current_acc] = "".join(current_seq)
+                    raw_acc = line[1:].split()[0]
+                    current_acc = raw_acc[3:] if raw_acc.startswith(("RS_", "GB_")) else raw_acc
+                    current_seq = []
+                elif line:
+                    current_seq.append(line)
+            if current_acc is not None:
+                marker_seqs[current_acc] = "".join(current_seq)
+
+        if i == 1:
+            genome_count = len(marker_seqs)
+            print(f"  {genome_count} genomes found", flush=True)
+
+        # Write/append each genome's record immediately — "w" on first marker
+        # to initialise clean files, "a" on all subsequent markers.
+        mode = "w" if i == 1 else "a"
+        for acc, seq in marker_seqs.items():
+            out_path = output_dir / f"{acc}.fna"
+            with open(out_path, mode, encoding="utf-8") as fh:
+                fh.write(f">{marker_name}\n{seq}\n")
+
+    print(f"Done: {genome_count} genome files written to {output_dir}")
+    return output_dir
+
+
+def _build_mg_mapping_file(
+    version: str,
+    datasets: List[str],
+    base_dir: Path,
+    mapping_file: Path,
+    mirror: str,
+    verbose: bool,
+) -> Optional[Path]:
+    """Build a combined marker-gene path mapping file across datasets.
+
+    Writes the same columns as the genome mapping file, but the path column points
+    to the concatenated marker gene file for each accession.
+    genome_length is the full genome size from metadata, not the marker gene file size.
+    """
+    version_dir = setup_version_dir(version, base_dir)
+    marker_genes_dir = version_dir / "marker_genes"
+
+    rows: List[Tuple[str, Path, str, str, str]] = []
+
+    for dataset in datasets:
+        extracted_dir = marker_genes_dir / f"{dataset}_marker_genes_all_{version}"
+        concat_dir = extracted_dir / "concatenated"
+        fna_dir = extracted_dir / "fna"
+
+        if not fna_dir.exists():
+            print(
+                f"Marker gene directory not found for {dataset}: {fna_dir}\n"
+                f"Run --download-marker-genes first.",
+                file=sys.stderr,
+            )
+            continue
+
+        if not concat_dir.exists():
+            print(
+                f"Concatenated marker gene files not found for {dataset}: {concat_dir}\n"
+                f"Run --build-mg first.",
+                file=sys.stderr,
+            )
+            continue
+
+        raw_accessions = _collect_accessions_from_marker_fna(fna_dir)
+        if not raw_accessions:
+            print(f"No accessions found in {fna_dir}", file=sys.stderr)
+            continue
+
+        metadata_file = download_metadata(version, dataset, version_dir, mirror=mirror, verbose=verbose)
+        if metadata_file is None:
+            print(f"Warning: Could not get metadata for {dataset}", file=sys.stderr)
+            continue
+
+        parser = MetadataParser(metadata_file)
+        for raw_acc in raw_accessions:
+            genome_metadata = parser.get_genome_metadata(raw_acc)
+            if genome_metadata is None:
+                if verbose:
+                    print(f"  No metadata for {raw_acc}")
+                continue
+            accession = _normalize_mapping_accession(
+                genome_metadata.get("accession", raw_acc)
+            ) or raw_acc
+            # Use the normalized accession (RS_/GB_ stripped) to match the output filenames
+            normalized_raw = raw_acc[3:] if raw_acc.startswith(("RS_", "GB_")) else raw_acc
+            genome_file = concat_dir / f"{normalized_raw}.fna"
+            if not genome_file.exists():
+                if verbose:
+                    print(f"  No concatenated file for {normalized_raw}, skipping")
+                continue
+            taxonomy = genome_metadata.get("gtdb_taxonomy", "")
+            genome_size = str(genome_metadata.get("genome_size", ""))
+            is_rep = "1" if parser.is_species_cluster_representative(raw_acc) else "0"
+            rows.append((accession, genome_file, taxonomy, is_rep, genome_size))
+
+    if not rows:
+        print(
+            "No concatenated marker gene files found. "
+            "Run --build-mg first to create per-genome files.",
+            file=sys.stderr,
+        )
+        return None
+
+    resolved_path = mapping_file if mapping_file.is_absolute() else Path.cwd() / mapping_file
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = resolved_path.with_suffix(resolved_path.suffix + ".tmp")
+
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(MG_MAPPING_HEADER)
+        for accession, mg_path, taxonomy, is_rep, genome_size in sorted(rows):
+            fh.write(f"{accession}\t{mg_path}\t{taxonomy}\t{is_rep}\t{genome_size}\n")
+
+    tmp_path.replace(resolved_path)
+    return resolved_path
+
+
+def _collect_accessions_from_marker_fna(fna_dir: Path) -> List[str]:
+    """
+    Read FASTA headers from marker gene .fna files to collect all accessions present.
+
+    The files are organized per-marker (one file per PF family, all genomes inside),
+    so we only need to read one file to get the full accession list.
+    """
+    accessions: List[str] = []
+    fna_files = sorted(fna_dir.glob("*.fna"))
+    if not fna_files:
+        return accessions
+    with open(fna_files[0], "r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith(">"):
+                accessions.append(line[1:].strip().split()[0])
+    return accessions
+
+
+def _build_marker_genes_mapping(
+    version: str,
+    dataset: str,
+    extracted_dir: Path,
+    version_dir: Path,
+    base_dir: Path,
+    mirror: str,
+    verbose: bool,
+) -> Optional[Path]:
+    """Build accession→local_path mapping TSV for an extracted marker genes directory.
+
+    Marker genes are stored per-marker (one file per PF family containing all genomes),
+    so local_path points to the shared extracted directory for every accession.
+    """
+    metadata_file = download_metadata(version, dataset, version_dir, mirror=mirror, verbose=verbose)
+    if metadata_file is None:
+        print(f"Warning: Could not get metadata for {dataset}, skipping mapping file", file=sys.stderr)
+        return None
+
+    parser = MetadataParser(metadata_file)
+
+    fna_dir = extracted_dir / "fna"
+    if not fna_dir.exists():
+        print(f"Warning: fna subdirectory not found in {extracted_dir}", file=sys.stderr)
+        return None
+
+    raw_accessions = _collect_accessions_from_marker_fna(fna_dir)
+    if not raw_accessions:
+        print(f"Warning: No accessions found in {fna_dir}", file=sys.stderr)
+        return None
+
+    rows: List[Tuple[str, Path, str, str, str]] = []
+    for raw_acc in raw_accessions:
+        genome_metadata = parser.get_genome_metadata(raw_acc)
+        if genome_metadata is None:
+            if verbose:
+                print(f"  Warning: No metadata found for {raw_acc}")
+            continue
+
+        accession = _normalize_mapping_accession(
+            genome_metadata.get("accession", raw_acc)
+        ) or raw_acc
+        genome_size = str(genome_metadata.get("genome_size", ""))
+        taxonomy = genome_metadata.get("gtdb_taxonomy", "")
+        is_rep = "1" if parser.is_species_cluster_representative(raw_acc) else "0"
+        rows.append((accession, extracted_dir, taxonomy, is_rep, genome_size))
+
+    mapping_path = version_dir / f"{dataset}_marker_genes_map.tsv"
+    tmp_path = mapping_path.with_suffix(".tsv.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        fh.write(MG_DIR_MAPPING_HEADER)
+        for accession, marker_path, taxonomy, is_rep, genome_size in sorted(rows):
+            fh.write(f"{accession}\t{marker_path}\t{taxonomy}\t{is_rep}\t{genome_size}\n")
+    tmp_path.replace(mapping_path)
+
+    print(f"Mapped {len(rows)} genomes to marker gene paths")
+    return mapping_path
+
+
+def _list_mgnify_catalogues() -> List[Dict]:
+    """Return available MGnify genome catalogues from the API."""
+    try:
+        resp = requests.get(
+            f"{MGNIFY_API_BASE}/genome-catalogues",
+            params={"page_size": 200},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("data", [])
+    except Exception as e:
+        print(f"Error fetching MGnify catalogues: {e}", file=sys.stderr)
+        return []
+
+
+def _fetch_mgnify_accessions(catalogue_id: str, verbose: bool = False) -> Optional[set]:
+    """Fetch all NCBI GCA/GCF base accessions for a MGnify catalogue.
+
+    Downloads the FTP genomes-all_metadata.tsv for the catalogue (single file,
+    much faster than API pagination) and reads the Genome_accession column.
+    Returns base accessions without version suffix (e.g. GCA_018713305) since
+    MGnify omits version numbers — GTDB matching strips versions on that side.
+    Returns None on error, or an empty set if no NCBI accessions are available
+    for this catalogue.
+    """
+    try:
+        resp = requests.get(
+            f"{MGNIFY_API_BASE}/genome-catalogues/{catalogue_id}",
+            timeout=30,
+        )
+        resp.raise_for_status()
+        ftp_url = resp.json().get("data", {}).get("attributes", {}).get("ftp-url", "").rstrip("/")
+    except Exception as e:
+        print(f"Error fetching catalogue info for {catalogue_id}: {e}", file=sys.stderr)
+        return None
+
+    if not ftp_url:
+        print(f"No FTP URL for catalogue {catalogue_id}", file=sys.stderr)
+        return None
+
+    metadata_url = f"{ftp_url}/genomes-all_metadata.tsv"
+    if verbose:
+        print(f"  Downloading: {metadata_url}")
+
+    try:
+        resp = requests.get(metadata_url, timeout=120, stream=True)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Error downloading MGnify metadata TSV: {e}", file=sys.stderr)
+        return None
+
+    accessions: set = set()
+    genome_acc_col: Optional[int] = None
+
+    for i, line in enumerate(resp.iter_lines(decode_unicode=True)):
+        if i == 0:
+            headers = line.split("\t")
+            try:
+                genome_acc_col = headers.index("Genome_accession")
+            except ValueError:
+                print(
+                    f"Column 'Genome_accession' not found in MGnify metadata TSV.\n"
+                    f"Available columns: {', '.join(headers[:15])}",
+                    file=sys.stderr,
+                )
+                return None
+            continue
+
+        parts = line.split("\t")
+        if genome_acc_col is not None and genome_acc_col < len(parts):
+            acc = parts[genome_acc_col].strip()
+            if acc.startswith(("GCA_", "GCF_")):
+                accessions.add(acc.rsplit(".", 1)[0])
+
+    print(f"  Found {len(accessions)} NCBI accessions in MGnify catalogue", flush=True)
+    return accessions
+
+
+def _filter_gtdb_metadata_by_mgnify(
+    version: str,
+    datasets: List[str],
+    base_dir: Path,
+    mgnify_accessions: set,
+    output_path: Path,
+    mirror: str,
+    verbose: bool,
+) -> int:
+    """Intersect MGnify accessions against the full GTDB metadata (all genomes, not just
+    downloaded ones). Genome paths are filled in from the local mapping file where available.
+
+    Output columns: accession, genome_path, gtdb_taxonomy, is_representative, genome_length
+    genome_path is empty when the genome has not been downloaded locally.
+    Returns count of matching rows written.
+    """
+    version_dir = base_dir / version
+
+    # Load local genome paths from the mapping file (best-effort, may not exist)
+    path_lookup: Dict[str, str] = {}
+    mapping_path = _get_default_mapping_path(base_dir, version)
+    if mapping_path.exists():
+        with open(mapping_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.rstrip("\n").split("\t")
+                if parts[0] == "accession" or len(parts) < 2:
+                    continue
+                path_lookup[parts[0]] = parts[1]
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    count = 0
+
+    with open(tmp_path, "w", encoding="utf-8") as fout:
+        fout.write(MAPPING_HEADER)
+        for dataset in datasets:
+            metadata_file = download_metadata(version, dataset, version_dir, mirror=mirror, verbose=verbose)
+            if metadata_file is None:
+                print(f"Warning: metadata not available for {dataset}, skipping", file=sys.stderr)
+                continue
+
+            print(f"Scanning {dataset} metadata...", flush=True)
+            parser = MetadataParser(metadata_file)
+            for genome_metadata in parser.data.values():
+                raw_acc = genome_metadata.get("accession", "")
+                normalized = _normalize_mapping_accession(raw_acc)
+                if not normalized:
+                    continue
+                if normalized.rsplit(".", 1)[0] not in mgnify_accessions:
+                    continue
+                taxonomy = genome_metadata.get("gtdb_taxonomy", "")
+                genome_size = str(genome_metadata.get("genome_size", ""))
+                is_rep = "1" if parser.is_species_cluster_representative(raw_acc) else "0"
+                genome_path = path_lookup.get(normalized, "")
+                fout.write(
+                    f"{normalized}\t{genome_path}\t{taxonomy}\t{is_rep}\t{genome_size}\n"
+                )
+                count += 1
+
+    tmp_path.replace(output_path)
+    return count
 
 
 def main():
@@ -1152,6 +1570,16 @@ Examples:
     )
 
     parser.add_argument(
+        "--genome-type",
+        choices=["all", "isolate", "mag", "sag", "env"],
+        default="all",
+        help=(
+            "Filter by genome source: isolate (cultured), mag (metagenome-assembled), "
+            "sag (single-cell), env (environmental sample). Default: all"
+        )
+    )
+
+    parser.add_argument(
         "--ignore-prefix",
         action="store_true",
         help="Treat GCA_ and GCF_ accession prefixes as interchangeable for local file checks and URL resolution"
@@ -1178,6 +1606,19 @@ Examples:
     )
 
     parser.add_argument(
+        "--mapping-file-mg",
+        nargs="?",
+        const=Path("accession_mg_path_map.tsv"),
+        type=Path,
+        help=(
+            "Write a TSV mapping file pointing to per-genome concatenated marker gene files "
+            "(accession, concatenated_fna_path, gtdb_taxonomy, is_representative, genome_length). "
+            "genome_length is the full genome size from metadata, not the marker gene file size. "
+            "Requires --download-marker-genes and --build-mg to be run first."
+        )
+    )
+
+    parser.add_argument(
         "--failed-file",
         nargs="?",
         const=Path("failed_genomes.txt"),
@@ -1193,7 +1634,50 @@ Examples:
         action="store_true",
         help="Only download metadata, do not download genomes"
     )
-    
+
+    parser.add_argument(
+        "--download-marker-genes",
+        action="store_true",
+        help="Download marker gene tarballs for the selected GTDB version into {base_dir}/{version}/marker_genes/"
+    )
+
+    parser.add_argument(
+        "--build-mg",
+        action="store_true",
+        help=(
+            "Concatenate per-marker FASTA files into one file per genome, written to "
+            "{base_dir}/{version}/marker_genes/{dataset}_marker_genes_all_{version}/concatenated/. "
+            "Marker genes must be downloaded first with --download-marker-genes."
+        )
+    )
+
+    parser.add_argument(
+        "--mgnify-catalogues",
+        action="store_true",
+        help="List available MGnify genome catalogues (biome-specific genome collections)."
+    )
+
+    parser.add_argument(
+        "--mgnify-filter",
+        metavar="CATALOGUE_ID",
+        help=(
+            "Filter the GTDB accession mapping file to genomes present in a MGnify catalogue "
+            "(e.g. human-gut-v2-0, marine-v1-0). "
+            "Use --mgnify-catalogues to list available catalogues. "
+            "Reads the default mapping file for the selected GTDB version."
+        )
+    )
+
+    parser.add_argument(
+        "--mgnify-output",
+        metavar="FILE",
+        type=Path,
+        help=(
+            "Output path for the MGnify-filtered mapping TSV "
+            "(default: {catalogue_id}_accession_path_map.tsv in current directory)."
+        )
+    )
+
     parser.add_argument(
         "--verbose",
         "-v",
@@ -1255,7 +1739,7 @@ Examples:
             mirror=args.mirror,
             verbose=args.verbose,
         )
-        taxonomy_lookup = _collect_taxonomy_lookup_for_mapping(
+        taxonomy_lookup, genome_length_lookup = _collect_taxonomy_lookup_for_mapping(
             version=args.gtdb,
             datasets=datasets,
             base_dir=base_dir,
@@ -1269,11 +1753,69 @@ Examples:
             mapping_file=args.mapping_file,
             include_accessions=include_accessions,
             taxonomy_lookup=taxonomy_lookup,
+            genome_length_lookup=genome_length_lookup,
             show_progress=True,
         )
-        count = sum(1 for _ in open(mapping_path, "r", encoding="utf-8"))
+        count = sum(1 for _ in open(mapping_path, "r", encoding="utf-8")) - 1  # exclude header
         print(f"Mapping file written to: {mapping_path}")
         print(f"Mapped genomes: {count}")
+        return 0
+
+    if args.mapping_file_mg is not None and not args.taxon and not args.download:
+        datasets = ["bac120", "ar53"] if args.dataset == "all" else [args.dataset]
+        mapping_path = _build_mg_mapping_file(
+            version=args.gtdb,
+            datasets=datasets,
+            base_dir=base_dir,
+            mapping_file=args.mapping_file_mg,
+            mirror=args.mirror,
+            verbose=args.verbose,
+        )
+        if mapping_path is None:
+            return 1
+        count = sum(1 for _ in open(mapping_path, "r", encoding="utf-8")) - 1  # exclude header
+        print(f"Marker gene mapping file written to: {mapping_path}")
+        print(f"Mapped genomes: {count}")
+        return 0
+
+    if args.mgnify_catalogues:
+        catalogues = _list_mgnify_catalogues()
+        if not catalogues:
+            return 1
+        print("Available MGnify genome catalogues:")
+        for cat in catalogues:
+            cat_id = cat.get("id", "")
+            attrs = cat.get("attributes", {})
+            name = attrs.get("name", "")
+            biome = attrs.get("catalogue-biome-label", "")
+            genome_count = attrs.get("genome-count", "?")
+            print(f"  {cat_id:40s}  {genome_count:>8} genomes  {name or biome}")
+        return 0
+
+    if args.mgnify_filter:
+        output_path = args.mgnify_output or Path(f"{args.mgnify_filter}_accession_path_map.tsv")
+        if not output_path.is_absolute():
+            output_path = Path.cwd() / output_path
+
+        datasets = ["bac120", "ar53"] if args.dataset == "all" else [args.dataset]
+
+        print(f"Fetching MGnify catalogue: {args.mgnify_filter}...")
+        mgnify_accessions = _fetch_mgnify_accessions(args.mgnify_filter, verbose=args.verbose)
+        if mgnify_accessions is None:
+            return 1
+        print(f"Fetched {len(mgnify_accessions)} accessions from MGnify.")
+
+        count = _filter_gtdb_metadata_by_mgnify(
+            version=args.gtdb,
+            datasets=datasets,
+            base_dir=base_dir,
+            mgnify_accessions=mgnify_accessions,
+            output_path=output_path,
+            mirror=args.mirror,
+            verbose=args.verbose,
+        )
+        print(f"Filtered mapping written to: {output_path}")
+        print(f"Matching genomes: {count} (out of {len(mgnify_accessions)} MGnify accessions)")
         return 0
 
     # Handle --download flag (metadata only)
@@ -1295,6 +1837,88 @@ Examples:
             else:
                 print(f"✗ Failed to download metadata for {ds}", file=sys.stderr)
                 ok = False
+        return 0 if ok else 1
+
+    # Handle --download-marker-genes flag
+    if args.download_marker_genes:
+        datasets = ["bac120", "ar53"] if args.dataset == "all" else [args.dataset]
+        version_dir = setup_version_dir(args.gtdb, base_dir)
+        marker_genes_dir = version_dir / "marker_genes"
+        marker_genes_dir.mkdir(parents=True, exist_ok=True)
+        ok = True
+        for ds in datasets:
+            try:
+                url = get_marker_genes_url(args.gtdb, ds, mirror=args.mirror)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                ok = False
+                continue
+
+            filename = url.split("/")[-1]
+            dest = marker_genes_dir / filename
+
+            # Download only if tarball not already present (safe to skip after interrupted extraction)
+            if dest.exists():
+                print(f"Already downloaded: {dest}")
+            else:
+                print(f"Downloading marker genes ({ds}) from {url}...")
+                if not download_file(url, dest, verbose=args.verbose):
+                    print(f"✗ Failed to download marker genes for {ds}", file=sys.stderr)
+                    ok = False
+                    continue
+                print(f"✓ Marker genes downloaded: {dest}")
+
+            # Determine extracted directory name from tarball top-level entry
+            with tarfile.open(dest, "r:gz") as tar:
+                top_dirs = {m.name.split("/")[0] for m in tar.getmembers() if m.name.split("/")[0]}
+            extracted_name = top_dirs.pop() if len(top_dirs) == 1 else filename.removesuffix(".tar.gz")
+            extracted_dir = marker_genes_dir / extracted_name
+
+            if not extracted_dir.exists():
+                print(f"Extracting {filename}...")
+                with tarfile.open(dest, "r:gz") as tar:
+                    tar.extractall(marker_genes_dir)
+                print(f"✓ Extracted to: {extracted_dir}")
+            else:
+                print(f"Already extracted: {extracted_dir}")
+
+            mapping_path = _build_marker_genes_mapping(
+                version=args.gtdb,
+                dataset=ds,
+                extracted_dir=extracted_dir,
+                version_dir=version_dir,
+                base_dir=base_dir,
+                mirror=args.mirror,
+                verbose=args.verbose,
+            )
+            if mapping_path:
+                print(f"Marker genes mapping file: {mapping_path}")
+            else:
+                ok = False
+        return 0 if ok else 1
+
+    # Handle --build-mg flag
+    if args.build_mg:
+        datasets = ["bac120", "ar53"] if args.dataset == "all" else [args.dataset]
+        version_dir = setup_version_dir(args.gtdb, base_dir)
+        marker_genes_dir = version_dir / "marker_genes"
+        ok = True
+        for ds in datasets:
+            extracted_dir = marker_genes_dir / f"{ds}_marker_genes_all_{args.gtdb}"
+            if not (extracted_dir / "fna").exists():
+                print(
+                    f"Marker genes not found for {ds}: {extracted_dir / 'fna'}\n"
+                    f"Download them first with: gtdb-dl --gtdb {args.gtdb} --download-marker-genes",
+                    file=sys.stderr,
+                )
+                ok = False
+                continue
+            print(f"Building concatenated marker gene files for {ds}...")
+            out_dir = _concat_marker_genes_for_dataset(extracted_dir, verbose=args.verbose)
+            if out_dir is None:
+                ok = False
+            else:
+                print(f"✓ Concatenated files written to: {out_dir}")
         return 0 if ok else 1
 
     # Handle taxon- and/or accession-based download
@@ -1327,7 +1951,8 @@ Examples:
                 failed_file=args.failed_file,
                 verbose=args.verbose,
                 dry_run=args.dry_run,
-                resolved_accessions=resolved_accessions
+                resolved_accessions=resolved_accessions,
+                genome_type=args.genome_type,
             )
             overall_success = overall_success and success
 
@@ -1372,7 +1997,7 @@ Examples:
                 accessions=accession_queries or None,
                 ignore_prefix=args.ignore_prefix,
             )
-            taxonomy_lookup = _collect_taxonomy_lookup_for_mapping(
+            taxonomy_lookup, genome_length_lookup = _collect_taxonomy_lookup_for_mapping(
                 version=args.gtdb,
                 datasets=datasets,
                 base_dir=base_dir,
@@ -1386,6 +2011,7 @@ Examples:
                 mapping_file=args.mapping_file,
                 include_accessions=include_accessions,
                 taxonomy_lookup=taxonomy_lookup,
+                genome_length_lookup=genome_length_lookup,
                 show_progress=True,
             )
             print(f"Requested mapping file written to: {mapping_path}")

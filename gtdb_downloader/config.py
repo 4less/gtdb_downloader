@@ -35,6 +35,34 @@ def get_base_dir():
     return Path(base_dir)
 
 
+def get_marker_genes_url(version: str, dataset: str, mirror: str = "europe") -> str:
+    """
+    Get the download URL for the marker genes tarball (genomic_files_reps).
+
+    Args:
+        version: GTDB version (e.g., 'r226')
+        dataset: Dataset type ('bac120' or 'ar53')
+        mirror: Mirror to use ('europe', 'asia-pacific1', 'asia-pacific2')
+
+    Returns:
+        Download URL for the marker genes tar.gz file
+    """
+    if mirror not in MIRRORS:
+        raise ValueError(f"Unknown mirror: {mirror}. Available: {', '.join(MIRRORS.keys())}")
+
+    if version not in GTDB_VERSIONS:
+        raise ValueError(f"Unknown version: {version}. Available: {', '.join(GTDB_VERSIONS.keys())}")
+
+    if dataset not in DATASETS:
+        raise ValueError(f"Unknown dataset: {dataset}. Available: {', '.join(DATASETS.keys())}")
+
+    base_url = MIRRORS[mirror]
+    release_path = GTDB_VERSIONS[version]
+    filename = f"{dataset}_marker_genes_all_{version}.tar.gz"
+
+    return f"{base_url}{release_path}/genomic_files_all/{filename}"
+
+
 def get_metadata_url(version: str, dataset: str, mirror: str = "europe") -> str:
     """
     Get the download URL for metadata

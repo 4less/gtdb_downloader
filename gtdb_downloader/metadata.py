@@ -8,6 +8,14 @@ from typing import Dict, Iterable, List, Set, Tuple, Optional
 import io
 
 
+GENOME_TYPE_CATEGORIES = {
+    "isolate": "none",
+    "mag": "derived from metagenome",
+    "sag": "derived from single cell",
+    "env": "derived from environmental sample",
+}
+
+
 class MetadataParser:
     """Parse GTDB metadata files"""
     
@@ -77,7 +85,16 @@ class MetadataParser:
                         matching_genomes.append(genome_id)
             return matching_genomes
 
-        query_components = [part.strip() for part in query.split(";") if part.strip()]
+        # Normalise underscores to spaces in the part after the rank prefix so
+        # that file-name-style queries like s__Bacteroides_ovatus match the
+        # taxonomy string s__Bacteroides ovatus.
+        def _norm_underscores(component: str) -> str:
+            if "__" in component:
+                prefix, name = component.split("__", 1)
+                return f"{prefix}__{name.replace('_', ' ')}"
+            return component.replace("_", " ")
+
+        query_components = [_norm_underscores(part.strip()) for part in query.split(";") if part.strip()]
         query_components_lower = [part.lower() for part in query_components]
 
 
@@ -350,6 +367,16 @@ class MetadataParser:
         if value.startswith("RS_") or value.startswith("GB_"):
             value = value[3:]
         return value
+
+    def filter_by_genome_type(self, genome_ids: List[str], genome_type: str) -> List[str]:
+        """Filter genome IDs by ncbi_genome_category. genome_type must be a key of GENOME_TYPE_CATEGORIES."""
+        category = GENOME_TYPE_CATEGORIES.get(genome_type)
+        if category is None:
+            return genome_ids
+        return [
+            gid for gid in genome_ids
+            if self.data.get(gid, {}).get("ncbi_genome_category", "none") == category
+        ]
 
     def get_species_cluster_representative(self, genome_id: str) -> Optional[str]:
         """

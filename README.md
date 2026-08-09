@@ -15,6 +15,9 @@ This script was developed with the help of ChatGPT.
 - Download genomes using aria2 (with wget fallback)
 - Store genomes in a single folder with taxonomy-based symlink structure
 - Maintain an accession-to-path mapping TSV for downloaded raw genomes
+- Filter by genome source (isolate, MAG, SAG, environmental)
+- Download GTDB marker genes and build one concatenated FASTA per genome
+- Restrict a mapping file to a MGnify biome catalogue (e.g. human gut, marine)
 - Custom base directory support via environment variable
 
 ## Installation
@@ -114,7 +117,54 @@ gtdb-dl --gtdb r226 --mapping-file
 
 # Write mapping TSV to a custom path
 gtdb-dl --gtdb r226 --mapping-file /path/to/accession_path_map.tsv
+
+# Restrict a download to one genome source category
+gtdb-dl --gtdb r226 --taxon "Bacteroidota" --genome-type isolate
 ```
+
+`--genome-type` filters on NCBI's genome category: `isolate` (cultured),
+`mag` (metagenome-assembled), `sag` (single-cell), `env` (environmental sample),
+or `all` (default).
+
+### Marker genes
+
+Download the GTDB marker gene tarballs and collapse them into one FASTA per
+genome (one record per marker, in consistent sorted-marker order) — suitable
+for per-marker MSA preparation:
+
+```bash
+# Download + extract marker gene tarballs into {base_dir}/{version}/marker_genes/
+gtdb-dl --gtdb r226 --download-marker-genes
+
+# Concatenate per-marker FASTAs into one file per genome
+gtdb-dl --gtdb r226 --build-mg
+
+# Write a mapping TSV pointing at the concatenated per-genome files
+gtdb-dl --gtdb r226 --mapping-file-mg /path/to/accession_mg_path_map.tsv
+```
+
+`--build-mg` writes to
+`{base_dir}/{version}/marker_genes/{dataset}_marker_genes_all_{version}/concatenated/`.
+In the `--mapping-file-mg` output, `genome_length` is still the full genome size
+from metadata, not the size of the marker gene file.
+
+### Filter by MGnify catalogue
+
+Intersect GTDB against a MGnify biome-specific genome catalogue:
+
+```bash
+# List available catalogues
+gtdb-dl --gtdb r226 --mgnify-catalogues
+
+# Filter the mapping file to one catalogue
+gtdb-dl --gtdb r226 --mgnify-filter human-gut-v2-0-2
+
+# Choose the output path
+gtdb-dl --gtdb r226 --mgnify-filter marine-v2-0 --mgnify-output marine_map.tsv
+```
+
+The filter runs against the full GTDB metadata, not just locally downloaded
+genomes, so `genome_path` is empty for genomes you have not downloaded yet.
 
 ### Download a specific list of assemblies
 
@@ -230,6 +280,16 @@ With `--output /path/to/my_project`:
 - **Mapping file**: `~/.gtdb_downloader/r226/accession_path_map.tsv`
 
 The accession mapping file is rebuilt from the actual contents of the shared `raw/` directory after taxon downloads, so it reflects files that exist locally rather than predicted URLs.
+
+Mapping files are tab-separated with a header row and five columns:
+
+```
+accession	genome_path	gtdb_taxonomy	is_representative	genome_length
+GCA_000005845.2	~/.gtdb_downloader/raw/GCA_000005845.2.fna.gz	d__Bacteria;p__Pseudomonadota;...	1	4641652
+```
+
+`is_representative` is `1` when the genome is its species-cluster representative,
+`0` otherwise. `genome_length` is the genome size reported in GTDB metadata.
 
 ## Command Reference
 
