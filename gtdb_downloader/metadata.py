@@ -111,7 +111,10 @@ class MetadataParser:
             if not taxonomy:
                 continue
 
-            taxonomy_components = self.get_taxonomy_components(taxonomy)
+            # Normalised exactly like the query. GTDB names contain real underscores
+            # (Enterococcus_B, Prevotella copri_B): turning them into spaces on the query
+            # side only made every such taxon unmatchable -- g__Enterococcus_B found nothing.
+            taxonomy_components = [_norm_underscores(p) for p in self.get_taxonomy_components(taxonomy)]
             taxonomy_components_lower = [part.lower() for part in taxonomy_components]
             taxonomy_names_lower = [_strip_rank_prefix(part).lower() for part in taxonomy_components]
 
